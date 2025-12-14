@@ -7,7 +7,13 @@ from nw import CNNActorCritic
 import os
 from agent import train_one_iteration
 import chess
-from constants import CHECKPOINT_PATH, TRAINING_MCTS_SIMULATIONS, TRAINING_MAX_MOVES
+from constants import (
+    CHECKPOINT_PATH,
+    TRAINING_MCTS_SIMULATIONS,
+    TRAINING_MAX_MOVES,
+    LEARNING_RATE,
+    WEIGHT_DECAY,
+)
 from replay_buffer import load_replay_buffer, save_replay_buffer
 
 
@@ -23,7 +29,9 @@ def main(device: str="cuda"):
     else:
         print("Model not loaded. Creating new one...")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(),
+                                 lr=LEARNING_RATE,
+                                 weight_decay=WEIGHT_DECAY)
 
     # Загрузка replay buffer, если файл существует
     print("Trying to load replay buffer...")

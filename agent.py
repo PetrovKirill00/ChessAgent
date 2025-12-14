@@ -23,7 +23,9 @@ from constants import (
     THREEFOLD,
     TEMPERATURE_TAU_START,
     TEMPERATURE_TAU_END,
-    TEMPERATURE_DECAY_PLY, REPETITION_PENALTY
+    TEMPERATURE_DECAY_PLY,
+    REPETITION_PENALTY,
+    GRADIENT_CLIP_NORM
 )
 from replay_buffer import replay_buffer
 
@@ -211,6 +213,7 @@ def train_one_iteration(model: CNNActorCritic,
 
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRADIENT_CLIP_NORM)
         optimizer.step()
 
         last_loss = float(loss.detach().item())
