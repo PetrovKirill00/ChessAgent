@@ -26,14 +26,14 @@ INFERENCE_BATCH_SIZE = 256
 DIRICHLET_ALPHA = 0.3
 DIRICHLET_EPSILON = 0.35
 CONTEMPT_AGAINST_DRAW = 0
-REPETITION_PENALTY = -2.0
+REPETITION_PENALTY = -0.5
 THREEFOLD = True
 
 # temperature schedule (self-play)
-TEMPERATURE_MOVES = 256
+TEMPERATURE_MOVES = 512
 TEMPERATURE_TAU_START = 2     # tau на самом старте партии
 TEMPERATURE_TAU_END   = 0.2    # минимальный tau перед переходом в greedy
-TEMPERATURE_DECAY_PLY = 196      # за сколько полуходов (ply) опускаем tau до end
+TEMPERATURE_DECAY_PLY = 384      # за сколько полуходов (ply) опускаем tau до end
 
 
 # ================== Гиперпараметры буфера ==================
