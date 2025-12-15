@@ -126,19 +126,33 @@ def self_play_game(model: CNNActorCritic,
         moves_cnt += 1
 
     outcome = board.outcome(claim_draw=THREEFOLD)
-
-    if outcome is None or outcome.winner is None:
-        if outcome.termination == chess.Termination.THREEFOLD_REPETITION:
-            z_white = REPETITION_PENALTY
-        else:
-            z_white = CONTEMPT_AGAINST_DRAW
-    else:
-        z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
-
     data = []
-    for obs, pi_vec, player in trajectory:
-        z = z_white if player == chess.WHITE else -z_white
-        data.append((obs, pi_vec, z))
+
+    if outcome is None:
+        # считаем это "обычной" ничьёй
+        z = CONTEMPT_AGAINST_DRAW
+        for obs, pi_vec, player in trajectory:
+            data.append((obs, pi_vec, z))
+        return data, outcome
+    elif outcome.winner is None:
+        # НИЧЬЯ: делим на повторение и остальные причины
+        is_repetition = outcome.termination in (
+            chess.Termination.THREEFOLD_REPETITION,
+            chess.Termination.FIVEFOLD_REPETITION,
+        )
+
+        z = REPETITION_PENALTY if is_repetition else CONTEMPT_AGAINST_DRAW
+
+        # тут ты можешь решать: хочешь ли одинаковый z для обоих,
+        # или антисимметрию как раньше. Сейчас — одинаковый для обоих:
+        for obs, pi_vec, player in trajectory:
+            data.append((obs, pi_vec, z))
+    else:
+        # ПОБЕДА/ПОРАЖЕНИЕ: оставляем старую логику
+        z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
+        for obs, pi_vec, player in trajectory:
+            z = z_white if player == chess.WHITE else -z_white
+            data.append((obs, pi_vec, z))
 
     return data, outcome
 
