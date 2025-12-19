@@ -1,3 +1,4 @@
+import copy
 import math
 import random
 import numpy as np
@@ -25,7 +26,7 @@ from constants import (
     TEMPERATURE_TAU_END,
     TEMPERATURE_DECAY_PLY,
     REPETITION_PENALTY,
-    GRADIENT_CLIP_NORM
+    GRADIENT_CLIP_NORM,
 )
 from replay_buffer import replay_buffer
 
@@ -98,32 +99,54 @@ def self_play_game(model: CNNActorCritic,
     trajectory = []
     moves_cnt = 0
 
-    while not board.is_game_over(claim_draw=THREEFOLD) and moves_cnt < max_moves:
+    forbidden = set()
+
+    while moves_cnt < max_moves:
         player = board.turn
         obs = board_to_obs(board, position_deque)
 
-        # MCTS c шумом Дирихле в корне
-        move, policy = mcts.run(board, add_dirichlet_noise=True, reuse_tree=True)
+        move0, policy0 = mcts.run(board, add_dirichlet_noise=True, reuse_tree=True)
 
-        # π всегда берём как нормализованные visit counts
+        # 1) фильтруем forbidden
+        policy = {mv: w for mv, w in policy0.items() if mv not in forbidden}
+
+        # 2) если всё запретили — сбрасываем запреты (иначе бесконечный pop/continue)
+        cleared = False
+        if not policy:
+            cleared = True
+            forbidden.clear()
+            policy = dict(policy0)
+
+        # π логируем по текущей policy (после фильтра)
         pi_vec = policy_to_pi_vector(board, policy)
 
-        # Для первых ходов выбираем действие случайно из policy
+        # 3) выбираем move ТОЛЬКО из текущей policy
         if moves_cnt < TEMPERATURE_MOVES:
             moves_list = list(policy.keys())
             probs = np.array([policy[m] for m in moves_list], dtype=np.float64)
-
-            tau = temperature_tau(moves_cnt)  # <-- schedule вместо фиксированного 1.25
+            tau = temperature_tau(moves_cnt)
             probs = apply_temperature(probs, tau=tau)
-
             move = moves_list[np.random.choice(len(moves_list), p=probs)]
+        else:
+            move = max(policy, key=policy.get)
 
-        # после temperature_moves оставляем move, который вернул MCTS (argmax)
+        board.push(move)
+
+        # 4) обрубаем ходы, которые делают repetition claimable
+        if not cleared and board.can_claim_threefold_repetition():
+            board.pop()
+            forbidden.add(move)
+            continue
+
+        forbidden.clear()
 
         trajectory.append((obs, pi_vec, player))
-        board.push(move)
         position_deque.append(board_to_planes(board))
         moves_cnt += 1
+
+        # если хочешь — можно оставить этот break как “нормальный” конец партии
+        if board.is_game_over(claim_draw=THREEFOLD):
+            break
 
     outcome = board.outcome(claim_draw=THREEFOLD)
     data = []

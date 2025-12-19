@@ -12,7 +12,7 @@ from constants import (
     TRAINING_MCTS_SIMULATIONS,
     TRAINING_MAX_MOVES,
     LEARNING_RATE,
-    WEIGHT_DECAY,
+    WEIGHT_DECAY, SAVE_MODEL_PER_GAMES, SAVE_BUFFER_PER_GAMES,
 )
 from replay_buffer import load_replay_buffer, save_replay_buffer
 
@@ -102,10 +102,10 @@ def main(device: str="cuda"):
             print()
 
             # периодически сохраняем модель и replay buffer
-            if i % 10 == 0:
+            if i % SAVE_MODEL_PER_GAMES == 0:
                 torch.save(model.state_dict(), CHECKPOINT_PATH)
                 print(f"Checkpoint saved at iter {i}")
-            if i % 100 == 0:
+            if i % SAVE_BUFFER_PER_GAMES == 0:
                 save_replay_buffer()
                 print(f"Replay buffer saved at iter {i}")
 
