@@ -38,18 +38,51 @@ class ReplayBuffer:
         return int(self.sz)
 
     def add_many(self, data: List[Tuple[np.ndarray, np.ndarray, float]]):
-        for obs, pi_vec, z in data:
-            obs = obs.astype(np.float32, copy=False)
-            pi_vec = pi_vec.astype(np.float32, copy=False)
-            z = np.float32(z)
+        if not data:
+            return
 
-            self.obs[self.idx] = obs
-            self.pi[self.idx] = pi_vec
-            self.z[self.idx] = z
+        if (
+            isinstance(data, tuple)
+            and len(data) == 3
+            and isinstance(data[0], np.ndarray)
+        ):
+            obs_batch, pi_batch, z_batch = data
+            obs_batch = obs_batch.astype(np.float32, copy=False)
+            pi_batch = pi_batch.astype(np.float32, copy=False)
+            z_batch = z_batch.astype(np.float32, copy=False)
+        else:
+            obs_batch = np.asarray([obs for obs, _, _ in data], dtype=np.float32)
+            pi_batch = np.asarray([pi_vec for _, pi_vec, _ in data], dtype=np.float32)
+            z_batch = np.asarray([z for _, _, z in data], dtype=np.float32)
 
-            self.idx = (self.idx + 1) % self.capacity
-            if self.sz < self.capacity:
-                self.sz += 1
+        n = int(z_batch.shape[0])
+        if n == 0:
+            return
+
+        if n > self.capacity:
+            obs_batch = obs_batch[-self.capacity:]
+            pi_batch = pi_batch[-self.capacity:]
+            z_batch = z_batch[-self.capacity:]
+            n = self.capacity
+
+        end = self.idx + n
+        if end <= self.capacity:
+            self.obs[self.idx:end] = obs_batch
+            self.pi[self.idx:end] = pi_batch
+            self.z[self.idx:end] = z_batch
+        else:
+            first = self.capacity - self.idx
+            self.obs[self.idx:] = obs_batch[:first]
+            self.pi[self.idx:] = pi_batch[:first]
+            self.z[self.idx:] = z_batch[:first]
+
+            remaining = n - first
+            self.obs[:remaining] = obs_batch[first:first + remaining]
+            self.pi[:remaining] = pi_batch[first:first + remaining]
+            self.z[:remaining] = z_batch[first:first + remaining]
+
+        self.idx = (self.idx + n) % self.capacity
+        self.sz = min(self.capacity, self.sz + n)
 
     def sample_exact(self, batch_size: int):
         """
@@ -192,8 +225,6 @@ def save_replay_buffer(path: str = DEFAULT_REPLAY_PATH) -> None:
 def load_replay_buffer(path: str = DEFAULT_REPLAY_PATH) -> bool:
     """
     Загружаем новый формат (version=2).
-    Если на диске старый формат (obs/pi/z) — загрузим его в draw_buffer,
-    чтобы не потерять старые данные.
     """
     if not os.path.exists(path):
         return False
@@ -213,7 +244,7 @@ def load_replay_buffer(path: str = DEFAULT_REPLAY_PATH) -> bool:
         rb.mate.z[:] = 0
         rb.mate.sz = 0
         rb.mate.idx = 0
-        rb.mate.add_many([(mate_obs[i], mate_pi[i], float(mate_z[i])) for i in range(len(mate_z))])
+        rb.mate.add_many((mate_obs, mate_pi, mate_z))
 
         # draw
         draw_obs = data["draw_obs"]
@@ -225,26 +256,8 @@ def load_replay_buffer(path: str = DEFAULT_REPLAY_PATH) -> bool:
         rb.draw.z[:] = 0
         rb.draw.sz = 0
         rb.draw.idx = 0
-        rb.draw.add_many([(draw_obs[i], draw_pi[i], float(draw_z[i])) for i in range(len(draw_z))])
+        rb.draw.add_many((draw_obs, draw_pi, draw_z))
 
-        return True
-
-    # ---- старый формат (твой текущий) ----
-    if "obs" in data and "pi" in data and "z" in data:
-        obs = data["obs"]
-        pi = data["pi"]
-        z = data["z"]
-
-        rb.draw.obs[:] = 0
-        rb.draw.pi[:] = 0
-        rb.draw.z[:] = 0
-        rb.draw.sz = 0
-        rb.draw.idx = 0
-
-        n = min(len(z), rb.draw.capacity)
-        # берём последние n (чтобы примерно соответствовало "самые свежие важнее")
-        start = len(z) - n
-        rb.draw.add_many([(obs[i], pi[i], float(z[i])) for i in range(start, start + n)])
         return True
 
     # непонятный файл
