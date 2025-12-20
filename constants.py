@@ -54,4 +54,4 @@ SAVE_BUFFER_PER_GAMES = 100
 MATE_BUFFER_FRACTION = 0.5   # доля REPLAY_CAPACITY под mate_buffer
 P_MATE_IN_BATCH = 0.5        # доля mate-позиций в каждом batch при sample
 # ==========================================
-WEB_MCTS_SIMULATIONS = 800
+WEB_MCTS_SIMULATIONS = 1600

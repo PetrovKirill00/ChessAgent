@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from uuid import uuid4
 
 import chess
 import torch
@@ -11,7 +14,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from constants import CHECKPOINT_PATH, LAST_POSITIONS, WEB_MCTS_SIMULATIONS
-from db import SessionLocal, Game, Move, create_tables
 from env import board_to_planes
 from nw import CNNActorCritic
 from agent import MCTS
@@ -19,14 +21,26 @@ from agent import MCTS
 
 app = FastAPI(
     title="Chess Agent Web API",
-    description="Игра в шахматы против агента. Есть web UI, API, хранение в БД.",
+    description="Игра в шахматы против агента. Есть web UI и API.",
 )
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-@app.on_event("startup")
-def _startup():
-    create_tables()
+@dataclass
+class GameState:
+    id: str
+    human_color: str
+    board: chess.Board
+    history: deque
+    moves_san: list[str] = field(default_factory=list)
+    moves_uci: list[str] = field(default_factory=list)
+    status: str = "ongoing"
+    result: str | None = None
+    termination: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+games: dict[str, GameState] = {}
 
 
 # -------- model / mcts --------
@@ -50,7 +64,7 @@ else:
     model.eval()
 
 
-mcts = MCTS(number_of_simulations=WEB_MCTS_SIMULATIONS, model=model, device=device)
+mcts = MCTS(model=model, device=device)
 
 
 # -------- schemas --------
@@ -99,56 +113,45 @@ def _outcome_info(board: chess.Board):
     return True, result, termination
 
 
-
-def _load_board_and_hist(db, game: Game):
-    """
-    Восстанавливаем board и историю последних позиций из БД ходов.
-    Это делает сервис stateless (не зависит от глобальной board/position_deque).
-    """
-    rows = (
-        db.query(Move)
-        .filter(Move.game_id == game.id)
-        .order_by(Move.ply)
-        .all()
-    )
-
-    board = chess.Board()
-    hist = deque(maxlen=LAST_POSITIONS)
-    hist.append(board_to_planes(board))
-
-    for r in rows:
-        mv = chess.Move.from_uci(r.uci)
-        if mv not in board.legal_moves:
-            raise HTTPException(status_code=500, detail=f"БД содержит нелегальный ход: {r.uci}")
-        board.push(mv)
-        hist.append(board_to_planes(board))
-
-    return board, hist, rows
-
-
-def _moves_san(rows: list[Move]) -> list[str]:
-    return [r.san for r in rows]
-
-
-def _get_game(db, game_id: str) -> Game:
-    g = db.get(Game, game_id)
-    if g is None:
-        raise HTTPException(status_code=404, detail="Game not found")
-    return g
-
-
 def _human_color_bool(human_color: str) -> bool:
     if human_color not in ("w", "b"):
         raise HTTPException(status_code=400, detail="human_color must be 'w' or 'b'")
     return chess.WHITE if human_color == "w" else chess.BLACK
 
 
-def _save_move(db, game: Game, board: chess.Board, mv: chess.Move):
-    # SAN надо брать ДО push
+def _new_game_state(human_color: str) -> GameState:
+    board = chess.Board()
+    hist = deque(maxlen=LAST_POSITIONS)
+    hist.append(board_to_planes(board))
+    return GameState(id=uuid4().hex, human_color=human_color, board=board, history=hist)
+
+
+def _save_move(game: GameState, board: chess.Board, mv: chess.Move):
     san = board.san(mv)
-    ply = len(board.move_stack) + 1
     board.push(mv)
-    db.add(Move(game_id=game.id, ply=ply, uci=mv.uci(), san=san))
+    game.moves_san.append(san)
+    game.moves_uci.append(mv.uci())
+    game.history.append(board_to_planes(board))
+
+
+def _update_game_status(game: GameState, board: chess.Board):
+    game_over, result, termination = _outcome_info(board)
+    if game_over:
+        game.status = "finished"
+        game.result = result
+        game.termination = termination
+    else:
+        game.status = "ongoing"
+        game.result = None
+        game.termination = None
+    return game_over, result, termination
+
+
+def _get_game(game_id: str) -> GameState:
+    game = games.get(game_id)
+    if game is None:
+        raise HTTPException(status_code=404, detail="Game not found")
+    return game
 
 
 # -------- endpoints --------
@@ -162,237 +165,170 @@ def new_game(req: NewGameRequest):
     human_color = req.human_color if req.human_color in ("w", "b") else "w"
     human_bool = _human_color_bool(human_color)
 
-    with SessionLocal() as db:
-        board = chess.Board()
-        g = Game(human_color=human_color, fen=board.fen(), status="ongoing", result=None)
-        db.add(g)
-        db.commit()
-        db.refresh(g)
+    game = _new_game_state(human_color)
+    board = game.board
 
-        engine_move_uci = None
+    engine_move_uci = None
 
-        # Если человек играет чёрными — движок делает первый ход сразу
-        if human_bool == chess.BLACK:
-            board_hist = deque(maxlen=LAST_POSITIONS)
-            board_hist.append(board_to_planes(board))
+    # Если человек играет чёрными — движок делает первый ход сразу
+    if human_bool == chess.BLACK:
+        mv, _policy = mcts.run(board, position_history=game.history, add_dirichlet_noise=False)
+        if mv is None:
+            raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
+        _save_move(game, board, mv)
+        engine_move_uci = mv.uci()
 
-            mv, _policy = mcts.run(board, position_history=board_hist, add_dirichlet_noise=False)
-            if mv is None:
-                raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
-            _save_move(db, g, board, mv)
-            engine_move_uci = mv.uci()
+    game_over, result, termination = _update_game_status(game, board)
+    games[game.id] = game
 
-        game_over, result, termination = _outcome_info(board)
-        g.fen = board.fen()
-        if game_over:
-            g.status = "finished"
-            g.result = result
-        db.commit()
-
-        rows = (
-            db.query(Move)
-            .filter(Move.game_id == g.id)
-            .order_by(Move.ply)
-            .all()
-        )
-
-        return MoveResponse(
-            game_id=g.id,
-            board_fen=board.fen(),
-            engine_move=engine_move_uci,
-            moves_san=_moves_san(rows),
-            game_over=game_over,
-            result=result,
-            termination=termination,
-        )
+    return MoveResponse(
+        game_id=game.id,
+        board_fen=board.fen(),
+        engine_move=engine_move_uci,
+        moves_san=game.moves_san,
+        game_over=game_over,
+        result=result,
+        termination=termination,
+    )
 
 
 @app.post("/make_move", response_model=MoveResponse)
 def make_move(req: MoveRequest):
-    with SessionLocal() as db:
-        g = _get_game(db, req.game_id)
+    game = _get_game(req.game_id)
+    board = game.board
 
-        board, hist, rows = _load_board_and_hist(db, g)
-        if board.is_game_over(claim_draw=True):
-            game_over, result, termination = _outcome_info(board)
-            return MoveResponse(
-                game_id=g.id,
-                board_fen=board.fen(),
-                engine_move=None,
-                moves_san=_moves_san(rows),
-                game_over=game_over,
-                result=result,
-                termination=termination,
-            )
-
-        human_bool = _human_color_bool(g.human_color)
-        if board.turn != human_bool:
-            raise HTTPException(status_code=400, detail="Сейчас не ход человека")
-
-        # parse move
-        try:
-            from_sq = chess.parse_square(req.from_square)
-            to_sq = chess.parse_square(req.to_square)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Некорректный формат клетки")
-
-        promo = _promotion_piece(req.promotion)
-
-        move_plain = chess.Move(from_sq, to_sq)
-        move_promo = chess.Move(from_sq, to_sq, promotion=promo) if promo is not None else None
-
-        if move_plain in board.legal_moves:
-            user_move = move_plain
-        elif move_promo is not None and move_promo in board.legal_moves:
-            user_move = move_promo
-        else:
-            raise HTTPException(status_code=400, detail="Невозможный ход")
-
-        # save user move
-        _save_move(db, g, board, user_move)
-        hist.append(board_to_planes(board))
-
-        # если после хода человека игра закончилась
-        if board.is_game_over(claim_draw=True):
-            game_over, result, termination = _outcome_info(board)
-            g.fen = board.fen()
-            g.status = "finished"
-            g.result = result
-            db.commit()
-
-            rows = (
-                db.query(Move)
-                .filter(Move.game_id == g.id)
-                .order_by(Move.ply)
-                .all()
-            )
-            return MoveResponse(
-                game_id=g.id,
-                board_fen=board.fen(),
-                engine_move=None,
-                moves_san=_moves_san(rows),
-                game_over=game_over,
-                result=result,
-                termination=termination,
-            )
-
-        # ход движка
-        engine_move, _policy = mcts.run(board, position_history=hist, add_dirichlet_noise=False)
-        if engine_move is None:
-            raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
-
-        _save_move(db, g, board, engine_move)
-        hist.append(board_to_planes(board))
-
-        game_over, result, termination = _outcome_info(board)
-
-        g.fen = board.fen()
-        if game_over:
-            g.status = "finished"
-            g.result = result
-        else:
-            g.status = "ongoing"
-            g.result = None
-
-        db.commit()
-
-        rows = (
-            db.query(Move)
-            .filter(Move.game_id == g.id)
-            .order_by(Move.ply)
-            .all()
-        )
-
+    if board.is_game_over(claim_draw=True):
+        game_over, result, termination = _update_game_status(game, board)
         return MoveResponse(
-            game_id=g.id,
+            game_id=game.id,
             board_fen=board.fen(),
-            engine_move=engine_move.uci(),
-            moves_san=_moves_san(rows),
+            engine_move=None,
+            moves_san=game.moves_san,
             game_over=game_over,
             result=result,
             termination=termination,
         )
+
+    human_bool = _human_color_bool(game.human_color)
+    if board.turn != human_bool:
+        raise HTTPException(status_code=400, detail="Сейчас не ход человека")
+
+    # parse move
+    try:
+        from_sq = chess.parse_square(req.from_square)
+        to_sq = chess.parse_square(req.to_square)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Некорректный формат клетки")
+
+    promo = _promotion_piece(req.promotion)
+
+    move_plain = chess.Move(from_sq, to_sq)
+    move_promo = chess.Move(from_sq, to_sq, promotion=promo) if promo is not None else None
+
+    if move_plain in board.legal_moves:
+        user_move = move_plain
+    elif move_promo is not None and move_promo in board.legal_moves:
+        user_move = move_promo
+    else:
+        raise HTTPException(status_code=400, detail="Невозможный ход")
+
+    # save user move
+    _save_move(game, board, user_move)
+
+    # если после хода человека игра закончилась
+    if board.is_game_over(claim_draw=True):
+        game_over, result, termination = _update_game_status(game, board)
+        return MoveResponse(
+            game_id=game.id,
+            board_fen=board.fen(),
+            engine_move=None,
+            moves_san=game.moves_san,
+            game_over=game_over,
+            result=result,
+            termination=termination,
+        )
+
+    # ход движка
+    engine_move, _policy = mcts.run(board, position_history=game.history, add_dirichlet_noise=False)
+    if engine_move is None:
+        raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
+
+    _save_move(game, board, engine_move)
+
+    game_over, result, termination = _update_game_status(game, board)
+
+    return MoveResponse(
+        game_id=game.id,
+        board_fen=board.fen(),
+        engine_move=engine_move.uci(),
+        moves_san=game.moves_san,
+        game_over=game_over,
+        result=result,
+        termination=termination,
+    )
 
 
 @app.post("/engine_move", response_model=MoveResponse)
 def engine_move(req: EngineMoveRequest):
-    with SessionLocal() as db:
-        g = _get_game(db, req.game_id)
-        board, hist, rows = _load_board_and_hist(db, g)
+    game = _get_game(req.game_id)
+    board = game.board
 
-        if board.is_game_over(claim_draw=True):
-            game_over, result, termination = _outcome_info(board)
-            return MoveResponse(
-                game_id=g.id,
-                board_fen=board.fen(),
-                engine_move=None,
-                moves_san=_moves_san(rows),
-                game_over=game_over,
-                result=result,
-                termination=termination,
-            )
-
-        human_bool = _human_color_bool(g.human_color)
-        if board.turn == human_bool:
-            raise HTTPException(status_code=400, detail="Сейчас ход человека, движок ходить не должен")
-
-        mv, _policy = mcts.run(board, position_history=hist, add_dirichlet_noise=False)
-        if mv is None:
-            raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
-
-        _save_move(db, g, board, mv)
-        hist.append(board_to_planes(board))
-
-        game_over, result, termination = _outcome_info(board)
-        g.fen = board.fen()
-        if game_over:
-            g.status = "finished"
-            g.result = result
-        db.commit()
-
-        rows = (
-            db.query(Move)
-            .filter(Move.game_id == g.id)
-            .order_by(Move.ply)
-            .all()
-        )
-
+    if board.is_game_over(claim_draw=True):
+        game_over, result, termination = _update_game_status(game, board)
         return MoveResponse(
-            game_id=g.id,
+            game_id=game.id,
             board_fen=board.fen(),
-            engine_move=mv.uci(),
-            moves_san=_moves_san(rows),
+            engine_move=None,
+            moves_san=game.moves_san,
             game_over=game_over,
             result=result,
             termination=termination,
         )
 
+    human_bool = _human_color_bool(game.human_color)
+    if board.turn == human_bool:
+        raise HTTPException(status_code=400, detail="Сейчас ход человека, движок ходить не должен")
+
+    mv, _policy = mcts.run(board, position_history=game.history, add_dirichlet_noise=False)
+    if mv is None:
+        raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
+
+    _save_move(game, board, mv)
+
+    game_over, result, termination = _update_game_status(game, board)
+
+    return MoveResponse(
+        game_id=game.id,
+        board_fen=board.fen(),
+        engine_move=mv.uci(),
+        moves_san=game.moves_san,
+        game_over=game_over,
+        result=result,
+        termination=termination,
+    )
+
 
 @app.get("/games/{game_id}")
 def get_game(game_id: str):
-    with SessionLocal() as db:
-        g = _get_game(db, game_id)
-        return {
-            "game_id": g.id,
-            "status": g.status,
-            "human_color": g.human_color,
-            "result": g.result,
-            "fen": g.fen,
-            "created_at": g.created_at.isoformat(),
-        }
+    game = _get_game(game_id)
+    return {
+        "game_id": game.id,
+        "status": game.status,
+        "human_color": game.human_color,
+        "result": game.result,
+        "termination": game.termination,
+        "fen": game.board.fen(),
+        "created_at": game.created_at.isoformat(),
+    }
 
 
 @app.get("/games/{game_id}/moves")
 def get_moves(game_id: str):
-    with SessionLocal() as db:
-        _ = _get_game(db, game_id)
-        rows = (
-            db.query(Move)
-            .filter(Move.game_id == game_id)
-            .order_by(Move.ply)
-            .all()
-        )
-        return [{"ply": m.ply, "uci": m.uci, "san": m.san, "ts": m.created_at.isoformat()} for m in rows]
+    game = _get_game(game_id)
+    out = []
+    for idx, (uci, san) in enumerate(zip(game.moves_uci, game.moves_san), start=1):
+        out.append({"ply": idx, "uci": uci, "san": san})
+    return out
 
 
 # -------- Web UI --------
@@ -517,14 +453,14 @@ def index():
         function onDrop(source, target) {
           if (!game || !gameId) return "snapback";
           if (source === target) return "snapback";
-        
+
           // базовый ход БЕЗ promotion
           let moveConfig = { from: source, to: target };
-        
+
           // promotion prompt
           const piece = game.get(source);
           let promo = null;
-        
+
           if (piece && piece.type === "p") {
             const fromRank = source[1], toRank = target[1];
             const isWhitePromotion = (piece.color === "w" && fromRank === "7" && toRank === "8");
@@ -537,14 +473,14 @@ def index():
               moveConfig.promotion = promo; // добавляем ТОЛЬКО здесь
             }
           }
-        
+
           // локальная проверка chess.js
           const mv = game.move(moveConfig);
           if (mv === null) return "snapback";
-        
+
           boardUI.position(game.fen());
           updateFen();
-        
+
           isMyTurn = false;
           sendMoveToServer(source, target, promo); // promo может быть null
         }
