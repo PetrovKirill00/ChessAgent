@@ -8,26 +8,7 @@ import torch
 import torch.nn.functional as F
 from nw import CNNActorCritic
 from collections import deque
-from constants import (
-    LAST_POSITIONS,
-    TOTAL_MOVES,
-    PIECE_VALUES,
-    BATCH_SIZE,
-    MIN_REPLAY_SIZE,
-    TRAIN_STEPS_PER_ITER,
-    INFERENCE_BATCH_SIZE,
-    TEMPERATURE_MOVES,
-    TRAINING_MCTS_SIMULATIONS,
-    DIRICHLET_ALPHA,
-    DIRICHLET_EPSILON,
-    CONTEMPT_AGAINST_DRAW,
-    THREEFOLD,
-    TEMPERATURE_TAU_START,
-    TEMPERATURE_TAU_END,
-    TEMPERATURE_DECAY_PLY,
-    REPETITION_PENALTY,
-    GRADIENT_CLIP_NORM,
-)
+from constants import *
 from replay_buffer import replay_buffer
 
 position_deque = deque(maxlen=LAST_POSITIONS)
@@ -78,7 +59,6 @@ def _material_diff(board: chess.Board) -> int:
     return diff
 
 def self_play_game(model: CNNActorCritic,
-                   num_simulations=64,
                    max_moves=200,
                    device="cpu"):
     """
@@ -88,8 +68,7 @@ def self_play_game(model: CNNActorCritic,
       pi_vec: np.ndarray [TOTAL_MOVES]
       z     : скаляр в {-1, 0, +1} с точки зрения игрока, который делал ход.
     """
-    mcts = MCTS(number_of_simulations=num_simulations,
-                model=model,
+    mcts = MCTS(model=model,
                 device=device,
                 inference_batch_size=INFERENCE_BATCH_SIZE)
     board = chess.Board()
@@ -99,46 +78,92 @@ def self_play_game(model: CNNActorCritic,
     trajectory = []
     moves_cnt = 0
 
-    forbidden = set()
-
     while moves_cnt < max_moves:
         player = board.turn
         obs = board_to_obs(board, position_deque)
 
-        move0, policy0 = mcts.run(board, add_dirichlet_noise=True, reuse_tree=True)
+        # 1) MCTS считаем ОДИН раз на позицию
+        nos = TRAINING_MCTS_SIMULATIONS
+        if THINK_LONGER_AS_GAME_GOES:
+            nos = max(nos,moves_cnt//THINK_COEFF)
+        _best_action, policy0 = mcts.run(board,
+                                         add_dirichlet_noise=True,
+                                         reuse_tree=True,
+                                         number_of_simulations=nos)
+        if not policy0:
+            break
 
-        # 1) фильтруем forbidden
-        policy = {mv: w for mv, w in policy0.items() if mv not in forbidden}
+        # root node нужен, чтобы корректно "переукоренить" дерево на реально выбранный ход
+        root_hash = int(chess.polyglot.zobrist_hash(board))
+        root_node = mcts.ttable.get(root_hash)
 
-        # 2) если всё запретили — сбрасываем запреты (иначе бесконечный pop/continue)
-        cleared = False
-        if not policy:
-            cleared = True
-            forbidden.clear()
-            policy = dict(policy0)
+        # Будем удалять ходы, которые приводят к threefold claimable
+        policy = dict(policy0)
 
-        # π логируем по текущей policy (после фильтра)
-        pi_vec = policy_to_pi_vector(board, policy)
+        def _renorm_inplace(p: dict[chess.Move, float]) -> None:
+            """Нормализация распределения p (sum -> 1). Делает p корректным для pi_vec."""
+            if not p:
+                return
+            if len(p) == 1:
+                mv = next(iter(p))
+                p.clear()
+                p[mv] = 1.0
+                return
+            s = float(sum(p.values()))
+            if s <= 1e-12:
+                n = len(p)
+                w = 1.0 / n
+                for mv in list(p.keys()):
+                    p[mv] = w
+                return
+            inv = 1.0 / s
+            for mv in list(p.keys()):
+                p[mv] = float(p[mv]) * inv
 
-        # 3) выбираем move ТОЛЬКО из текущей policy
-        if moves_cnt < TEMPERATURE_MOVES:
-            moves_list = list(policy.keys())
-            probs = np.array([policy[m] for m in moves_list], dtype=np.float64)
-            tau = temperature_tau(moves_cnt)
-            probs = apply_temperature(probs, tau=tau)
-            move = moves_list[np.random.choice(len(moves_list), p=probs)]
-        else:
-            move = max(policy, key=policy.get)
+        # 2) Сэмплим ход из policy, выкидывая "плохие" (threefold-claimable) ходы без повторного MCTS
+        while True:
+            # если остался единственный ход — делаем его независимо от threefold
+            if len(policy) == 1:
+                move = next(iter(policy))
+            else:
+                if moves_cnt < TEMPERATURE_MOVES:
+                    moves_list = list(policy.keys())
+                    probs = np.array([policy[m] for m in moves_list], dtype=np.float64)
 
-        board.push(move)
+                    tau = temperature_tau(moves_cnt)
+                    probs = apply_temperature(probs, tau=tau)  # нормализует
 
-        # 4) обрубаем ходы, которые делают repetition claimable
-        if not cleared and board.can_claim_threefold_repetition():
+                    move = moves_list[np.random.choice(len(moves_list), p=probs)]
+                else:
+                    move = max(policy, key=policy.get)
+
+            # пробуем ход
+            board.push(move)
+
+            # если ход делает троекратку claimable и есть альтернатива — откатываем и запрещаем
+            if len(policy) > 1 and board.can_claim_threefold_repetition():
+                board.pop()
+                policy.pop(move, None)
+                _renorm_inplace(policy)
+                continue
+
+            # 3) Ход принят. pi_vec должен соответствовать policy ПОСЛЕ выкидывания ходов, в позиции ДО хода
             board.pop()
-            forbidden.add(move)
-            continue
+            _renorm_inplace(policy)
+            pi_vec = policy_to_pi_vector(board, policy)
 
-        forbidden.clear()
+            # 4) Ставим ход на доску (реально играем)
+            board.push(move)
+
+            # 5) Правильное укоренение: переходим корнем на РЕАЛЬНО выбранный move
+            if root_node is not None and move in root_node.children:
+                child_h, _prior = root_node.children[move]
+                mcts._root_hash = child_h
+            else:
+                # fallback: на случай рассинхрона/редких краёв
+                mcts._root_hash = int(chess.polyglot.zobrist_hash(board))
+
+            break
 
         trajectory.append((obs, pi_vec, player))
         position_deque.append(board_to_planes(board))
@@ -182,7 +207,6 @@ def self_play_game(model: CNNActorCritic,
 
 def train_one_iteration(model: CNNActorCritic,
                         optimizer: torch.optim.Optimizer,
-                        num_simulations=TRAINING_MCTS_SIMULATIONS,
                         max_moves=200,
                         device="cpu"):
     """
@@ -196,14 +220,13 @@ def train_one_iteration(model: CNNActorCritic,
 
     # 1. self-play: одна партия
     data, outcome = self_play_game(model=model,
-                                   num_simulations=num_simulations,
                                    max_moves=max_moves,
                                    device=device)
     if data is None or len(data) == 0:
         return None
 
     # 2. добавляем позиции партии в буфер
-    replay_buffer.add_many(data)
+    replay_buffer.add_game(data, outcome)
     buffer_size = len(replay_buffer)
 
     # Если данных совсем мало — просто копим буфер, почти не обучаясь
@@ -234,7 +257,7 @@ def train_one_iteration(model: CNNActorCritic,
     model.train()
 
     for _ in range(train_steps):
-        obs_batch, pi_batch, z_batch = replay_buffer.sample(BATCH_SIZE)
+        obs_batch, pi_batch, z_batch = replay_buffer.sample(BATCH_SIZE, p_mate=P_MATE_IN_BATCH)
         total_positions_used += len(z_batch)
 
         obs_t = torch.as_tensor(obs_batch, dtype=torch.float32, device=device)
@@ -281,13 +304,11 @@ class Node:
 class MCTS:
     def __init__(
         self,
-        number_of_simulations: int = 100,
         c_puct: float = 1.5,
         model: CNNActorCritic | None = None,
         device: str = "cpu",
         inference_batch_size: int = 64,   # <<< главное: размер батча для NN
     ):
-        self.number_of_simulations = int(number_of_simulations)
         self.c_puct = float(c_puct)
         self.model = model
         self.device = device
@@ -355,7 +376,8 @@ class MCTS:
     def run(self, root_state: chess.Board,
             position_history=None,
             add_dirichlet_noise: bool = False,
-            reuse_tree: bool = False):
+            reuse_tree: bool = False,
+            number_of_simulations=TRAINING_MCTS_SIMULATIONS):
         assert self.model is not None, "MCTS: model is None"
 
         root_hash = self._board_hash(root_state)
@@ -373,7 +395,7 @@ class MCTS:
         # ---- батчим только evaluation/expansion ----
         pending = []  # список задач на оценку нейросетью
 
-        for _ in range(self.number_of_simulations):
+        for _ in range(number_of_simulations):
             res = self._traverse_to_leaf(root_state, root, position_history=position_history, root_prior_override=root_prior_override)
 
             if res["terminal"]:

@@ -52,7 +52,6 @@ def main(device: str="cuda"):
             stats = train_one_iteration(
                 model,
                 optimizer,
-                num_simulations=TRAINING_MCTS_SIMULATIONS,
                 max_moves=TRAINING_MAX_MOVES,
                 device=device,
             )
