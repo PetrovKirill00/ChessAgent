@@ -85,7 +85,7 @@ def self_play_game(model: CNNActorCritic,
         # 1) MCTS считаем ОДИН раз на позицию
         nos = TRAINING_MCTS_SIMULATIONS
         if THINK_LONGER_AS_GAME_GOES:
-            nos = max(nos,moves_cnt//THINK_COEFF)
+            nos = max(nos,int(moves_cnt*THINK_COEFF))
         _best_action, policy0 = mcts.run(board,
                                          add_dirichlet_noise=True,
                                          reuse_tree=True,

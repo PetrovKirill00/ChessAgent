@@ -172,7 +172,10 @@ def new_game(req: NewGameRequest):
 
     # Если человек играет чёрными — движок делает первый ход сразу
     if human_bool == chess.BLACK:
-        mv, _policy = mcts.run(board, position_history=game.history, add_dirichlet_noise=False)
+        mv, _policy = mcts.run(board,
+                               position_history=game.history,
+                               add_dirichlet_noise=False,
+                               number_of_simulations=WEB_MCTS_SIMULATIONS)
         if mv is None:
             raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
         _save_move(game, board, mv)
@@ -249,7 +252,10 @@ def make_move(req: MoveRequest):
         )
 
     # ход движка
-    engine_move, _policy = mcts.run(board, position_history=game.history, add_dirichlet_noise=False)
+    engine_move, _policy = mcts.run(board,
+                                    position_history=game.history,
+                                    add_dirichlet_noise=False,
+                                    number_of_simulations=WEB_MCTS_SIMULATIONS)
     if engine_move is None:
         raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
 
@@ -289,7 +295,10 @@ def engine_move(req: EngineMoveRequest):
     if board.turn == human_bool:
         raise HTTPException(status_code=400, detail="Сейчас ход человека, движок ходить не должен")
 
-    mv, _policy = mcts.run(board, position_history=game.history, add_dirichlet_noise=False)
+    mv, _policy = mcts.run(board,
+                           position_history=game.history,
+                           add_dirichlet_noise=False,
+                           number_of_simulations=WEB_MCTS_SIMULATIONS)
     if mv is None:
         raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
 
