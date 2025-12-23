@@ -24,23 +24,23 @@ SAVE_MODEL_PER_GAMES = 100
 TRAINING_MCTS_SIMULATIONS=128
 THINK_LONGER_AS_GAME_GOES = False
 THINK_COEFF = 0.8
-TRAINING_MAX_MOVES=256
-INFERENCE_BATCH_SIZE = 128
+TRAINING_MAX_MOVES=256_000
+INFERENCE_BATCH_SIZE = 256
 DIRICHLET_ALPHA = 0.3
 DIRICHLET_EPSILON = 0.25
 CONTEMPT_AGAINST_DRAW = -0.5
 REPETITION_PENALTY = -1.0
-THREEFOLD = True
+THREEFOLD = False
 
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
 GRADIENT_CLIP_NORM = 1.0
 
 # temperature schedule (self-play)
-TEMPERATURE_MOVES = 224
+TEMPERATURE_MOVES = 512
 TEMPERATURE_TAU_START = 3.0     # tau на самом старте партии
 TEMPERATURE_TAU_END   = 0.3    # минимальный tau перед переходом в greedy
-TEMPERATURE_DECAY_PLY = 192     # за сколько полуходов (ply) опускаем tau до end
+TEMPERATURE_DECAY_PLY = 384     # за сколько полуходов (ply) опускаем tau до end
 
 
 # ================== Гиперпараметры буфера ==================
