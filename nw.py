@@ -31,7 +31,7 @@ class ResidualBlock(nn.Module):
         return out
 
 
-class CNNActorCritic(nn.Module):
+class AlphaZeroNet(nn.Module):
     """
     AlphaZero-style: conv stem + несколько residual blocks, потом shared MLP,
     затем actor/critic головы.

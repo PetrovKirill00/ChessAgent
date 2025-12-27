@@ -3,6 +3,7 @@ import os
 from typing import List, Tuple, Optional
 
 import numpy as np
+import torch
 import chess  # нужен для определения CHECKMATE при add_game
 
 from constants import (
@@ -199,6 +200,31 @@ class DualReplayBuffer:
 
         perm = np.random.permutation(obs.shape[0])
         return obs[perm], pi[perm], z[perm]
+
+    # ---- Convenience helpers used by main.py ----
+    def sample_torch(self, batch_size: int, device: str | torch.device, p_mate: float = P_MATE_IN_BATCH):
+        """Sample and convert to torch tensors on `device`.
+
+        Returns:
+            obs_t: float32 (B, C, 8, 8)
+            pi_t:  float32 (B, A)
+            z_t:   float32 (B,)
+        """
+        obs, pi, z = self.sample(batch_size=batch_size, p_mate=p_mate)
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        obs_t = torch.from_numpy(obs).to(dev)
+        pi_t = torch.from_numpy(pi).to(dev)
+        z_t = torch.from_numpy(z).to(dev)
+        return obs_t, pi_t, z_t
+
+    def save(self, path: str = DEFAULT_REPLAY_PATH) -> None:
+        """Persist the global replay buffer to disk (npz)."""
+        save_replay_buffer(path)
+
+    def load(self, path: str = DEFAULT_REPLAY_PATH) -> bool:
+        """Load replay buffer from disk into the global singleton."""
+        return load_replay_buffer(path)
+
 
 
 # ===== lazy singleton buffer (важно для multiprocessing) =====

@@ -1,432 +1,686 @@
+# main.py
+# -*- coding: utf-8 -*-
+"""Main training loop.
+
+Architecture:
+- Main process hosts:
+    * the current training model (candidate)
+    * a central inference server (batched)
+    * replay buffer + training step loop
+    * an evaluation process (arena) for gating
+- N self-play worker processes generate games using MCTS,
+  but they do NOT hold weights locally; they ask the inference server
+  for (policy_logits, value) via multiprocessing queues.
+
+Gating (baseline freezing):
+- BEST_CHECKPOINT_PATH is the frozen baseline.
+- Candidate trains continuously in the main process.
+- Periodically we run arena: candidate vs best.
+- Promote if score lower bound >= EVAL_PROMOTE_SCORE,
+  where score = (W + 0.5*D) / N (standard chess score).
+
+Important:
+- Training uses draw contempt (see constants.py).
+- Evaluation/gating uses the standard chess score (draw=0.5).
+- On Windows, Ctrl+C noise from Intel runtimes (MKL/oneAPI) is silenced via
+  FOR_DISABLE_CONSOLE_CTRL_HANDLER=1 set BEFORE importing numpy/torch.
+"""
+
+from __future__ import annotations
+
+import os as _os
+
+# --- Windows: silence Intel Fortran (MKL/oneAPI) Ctrl+C handler ---
+# Some native runtimes print:
+#   forrtl: error (200): program aborting due to control-C event
+# when Ctrl+C is broadcast to child processes attached to the same console.
+# Setting this BEFORE importing NumPy/PyTorch prevents that noisy handler.
+if _os.name == "nt":
+    _os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1")
+
 import os
-
-# До импорта torch/numpy (уменьшает "шум" от Intel runtimes)
-os.environ.setdefault("FOR_DISABLE_STACK_TRACE", "1")
-os.environ.setdefault("KMP_WARNINGS", "0")
-os.environ.setdefault("KMP_SETTINGS", "0")
-
 import time
-import queue as _py_queue
-import multiprocessing as mp
-from dataclasses import dataclass
-from collections import deque
+import queue
+import signal
+import platform
 import traceback
+import multiprocessing as mp
 
 import numpy as np
 import torch
 import chess
 
-from nw import CNNActorCritic
 from constants import (
     CHECKPOINT_PATH,
-    DEFAULT_REPLAY_PATH,
+    BEST_CHECKPOINT_PATH,
+    REPLAY_PATH,
+    EVAL_CANDIDATE_PATH,
+    EVAL_TMP_DIR,
+    NUM_SELFPLAY_WORKERS,
+    MAX_GAME_LENGTH,
+    SERVER_MAX_INFERENCE_POSITIONS,
+    SERVER_BATCH_TIMEOUT_S,
+    SERVER_TICK_EVERY_S,
+    SERVER_DRAIN_GAMES_PER_TICK,
     SAVE_MODEL_PER_GAMES,
     SAVE_BUFFER_PER_GAMES,
-    TRAINING_MAX_MOVES,
+    BATCH_SIZE,
     LEARNING_RATE,
     WEIGHT_DECAY,
-    NUM_SELFPLAY_WORKERS,
-    SERVER_MAX_INFERENCE_POSITIONS,
-    SERVER_INFERENCE_WAIT_MS,
-    SERVER_DRAIN_GAMES_PER_TICK,
-    SERVER_TRAIN_STEPS_PER_GAME,
-    SERVER_IDLE_SLEEP_MS,
+    MIN_REPLAY_SIZE,
+    TRAIN_STEPS_PER_GAME,
+    EVAL_EVERY_GAMES,
+    EVAL_NUM_GAMES,
+    EVAL_PROMOTE_SCORE,
+    EVAL_SCORE_Z,
+    MCTS_SIMULATIONS, EVAL_MCTS_SIMULATIONS,
 )
 
+from nw import AlphaZeroNet
+from agent import (
+    InferenceClient,
+    self_play_game,
+    train_one_step,
+    play_game_models,
+    elo_diff_from_score,
+    score_lower_bound_from_counts,
+)
 from replay_buffer import get_replay_buffer, load_replay_buffer, save_replay_buffer
-from agent import InferenceClient, self_play_game, train_one_step
 
 
-# --- Windows Ctrl+C (console control) handler ---
-_WIN_CTRL_HANDLER_REF = None
+def _ensure_parent_dir(path: str) -> None:
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
 
 
-def _install_windows_ctrl_handler(on_ctrl):
+def _atomic_torch_save(state_dict, path: str) -> None:
+    """Write a checkpoint atomically to avoid partial files on crash."""
+    _ensure_parent_dir(path)
+    tmp = path + ".tmp"
+    torch.save(state_dict, tmp)
+    os.replace(tmp, path)
+
+
+def _install_sigint_handler(stop_event: mp.Event) -> None:
+    """Reliable Ctrl+C behavior.
+
+    Why we do NOT swallow SIGINT:
+    - If you install a handler that only sets a flag and returns,
+      Python may *not* interrupt blocking calls (Queue.get/put, etc.).
+      That makes Ctrl+C feel "stuck sometimes".
+    - We set stop_event AND then re-raise KeyboardInterrupt via default handler,
+      so main breaks out immediately and performs a graceful shutdown.
+
+    Double Ctrl+C:
+    - First Ctrl+C: graceful stop (stop_event set, then KeyboardInterrupt).
+    - Second Ctrl+C: hard exit (os._exit).
     """
-    Регистрирует SetConsoleCtrlHandler, чтобы перехватывать Ctrl+C на Windows.
-    Возвращаем True -> событие считается обработанным и НЕ идёт дальше (в т.ч. forrtl).
-    """
-    global _WIN_CTRL_HANDLER_REF
-    if os.name != "nt":
-        return None
+    if platform.system().lower() == "windows":
+        # Windows can also emit Ctrl+Break (SIGBREAK).
+        sigbreak = getattr(signal, "SIGBREAK", None)
+    else:
+        sigbreak = None
 
-    import ctypes
-    import ctypes.wintypes as wt
-
-    HandlerRoutine = ctypes.WINFUNCTYPE(wt.BOOL, wt.DWORD)
-
-    def _handler(ctrl_type):
-        try:
-            on_ctrl(int(ctrl_type))
-        except Exception:
-            pass
-        return True  # поглощаем событие
-
-    _WIN_CTRL_HANDLER_REF = HandlerRoutine(_handler)
-    ctypes.windll.kernel32.SetConsoleCtrlHandler(_WIN_CTRL_HANDLER_REF, True)
-    return _WIN_CTRL_HANDLER_REF
-
-
-@dataclass
-class InferenceRequest:
-    worker_id: int
-    req_id: int
-    obs_batch: np.ndarray
-
-
-def _selfplay_worker(worker_id, request_q, response_q, data_q, log_q, stop_event, seed):
-    """
-    Worker: генерирует self-play партии.
-    На Windows поглощаем Ctrl+C event, чтобы не было forrtl spam.
-    """
-    _install_windows_ctrl_handler(lambda _t: None)
-
-    try:
-        import numpy as _np
-        import random as _random
-        import torch as _torch
-
-        _torch.set_num_threads(1)
-        _random.seed(seed)
-        _np.random.seed(seed)
-
-        client = InferenceClient(
-            worker_id=worker_id,
-            request_q=request_q,
-            response_q=response_q,
-            stop_event=stop_event,
-            log_q=log_q,
-        )
-
-        while not stop_event.is_set():
-            data, outcome = self_play_game(
-                inference_client=client,
-                model=None,
-                max_moves=TRAINING_MAX_MOVES,
-                device="cpu",
-            )
-
-            if stop_event.is_set():
-                break
-
-            if not data:
-                continue
-
-            obs = _np.asarray([x[0] for x in data], dtype=_np.float32)
-            pi = _np.asarray([x[1] for x in data], dtype=_np.float32)
-            z = _np.asarray([x[2] for x in data], dtype=_np.float32)
-
-            is_mate = (
-                outcome is not None
-                and outcome.winner is not None
-                and outcome.termination == chess.Termination.CHECKMATE
-            )
-
-            if outcome is not None and outcome.winner is not None:
-                winner = 1 if outcome.winner == chess.WHITE else -1
-                termination = str(outcome.termination)
-            else:
-                winner = 0
-                termination = str(outcome.termination) if outcome is not None else "UNKNOWN"
-
-            data_q.put((obs, pi, z, bool(is_mate), int(winner), termination))
-
-    except BaseException:
-        if stop_event.is_set():
-            return
-        tb = traceback.format_exc()
-        try:
-            log_q.put(f"[worker {worker_id}] EXCEPTION:\n{tb}")
-        except Exception:
-            pass
-        try:
+    def _handler(sig, frame):
+        if not stop_event.is_set():
+            print("\n[main] Ctrl+C -> stopping gracefully (press Ctrl+C again to force)")
             stop_event.set()
+            # Raise KeyboardInterrupt to break out of any blocking calls immediately.
+            signal.default_int_handler(sig, frame)
+        else:
+            print("\n[main] Ctrl+C again -> hard exit")
+            os._exit(130)
+
+    # Install for Ctrl+C
+    signal.signal(signal.SIGINT, _handler)
+    # Install for Ctrl+Break on Windows (if present)
+    if sigbreak is not None:
+        try:
+            signal.signal(sigbreak, _handler)
         except Exception:
             pass
 
 
-def _collect_inference_requests(request_q, *, max_total_positions: int, wait_ms: int):
-    reqs = []
-    timeout_s = max(0.0, float(wait_ms) / 1000.0)
+def _install_windows_console_ctrl_ignore() -> None:
+    """Best-effort: ignore console Ctrl events in child processes on Windows.
 
+    Important: We do NOT install this in the main process, to keep Ctrl+C responsive.
+    In child processes it helps suppress native-runtime noise on Ctrl+C broadcast.
+    """
+    if _os.name != "nt":
+        return
     try:
-        worker_id, req_id, obs_batch = request_q.get(timeout=timeout_s)
-    except _py_queue.Empty:
-        return reqs
+        import ctypes  # stdlib
+        kernel32 = ctypes.windll.kernel32
 
-    total = int(obs_batch.shape[0])
-    reqs.append(InferenceRequest(int(worker_id), int(req_id), obs_batch))
+        HandlerRoutine = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
 
-    deadline = time.perf_counter() + timeout_s
-    while total < max_total_positions and time.perf_counter() < deadline:
-        try:
-            worker_id, req_id, obs_batch = request_q.get_nowait()
-        except _py_queue.Empty:
-            break
+        def _handler(_ctrl_type: int) -> bool:
+            # Return TRUE => handled. The main process coordinates shutdown.
+            return True
 
-        b = int(obs_batch.shape[0])
-        if total + b > max_total_positions:
-            request_q.put((worker_id, req_id, obs_batch))
-            break
-
-        reqs.append(InferenceRequest(int(worker_id), int(req_id), obs_batch))
-        total += b
-
-    return reqs
-
-
-def _serve_inference_batch(model, device, reqs, response_queues):
-    if not reqs:
-        return 0
-
-    sizes = [int(r.obs_batch.shape[0]) for r in reqs]
-    big_obs = np.concatenate([r.obs_batch for r in reqs], axis=0).astype(np.float32, copy=False)
-
-    model.eval()
-    obs_t = torch.as_tensor(big_obs, dtype=torch.float32, device=device)
-
-    with torch.no_grad():
-        logits, v_pred = model(obs_t)
-        probs = torch.softmax(logits, dim=-1).detach().cpu().numpy().astype(np.float32, copy=False)
-        values = v_pred.detach().cpu().numpy().reshape(-1).astype(np.float32, copy=False)
-
-    offset = 0
-    for r, b in zip(reqs, sizes):
-        p = probs[offset:offset + b]
-        v = values[offset:offset + b]
-        offset += b
-        response_queues[r.worker_id].put((r.req_id, p, v))
-
-    return int(big_obs.shape[0])
-
-
-def _try_qsize(q):
-    try:
-        return str(q.qsize())
+        global _WIN_CTRL_HANDLER_REF  # keep reference so GC doesn't remove it
+        _WIN_CTRL_HANDLER_REF = HandlerRoutine(_handler)
+        kernel32.SetConsoleCtrlHandler(_WIN_CTRL_HANDLER_REF, True)
     except Exception:
-        return "NA"
-
-
-def _gpm_100(finish_ts: deque) -> float:
-    """
-    Games Per Minute (GPM) по последним len(finish_ts) играм.
-    Берём (N-1) интервалов между t_first и t_last:
-        GPM = (N-1) * 60 / (t_last - t_first)
-    """
-    n = len(finish_ts)
-    if n < 2:
-        return 0.0
-    dt = float(finish_ts[-1] - finish_ts[0])
-    if dt <= 1e-9:
-        return 0.0
-    return (n - 1) * 60.0 / dt
-
-
-def main(device="cuda"):
-    os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
-
-    try:
-        mp.set_start_method("spawn", force=True)
-    except RuntimeError:
         pass
 
-    stop_event = mp.Event()
 
-    # В main тоже поглощаем Ctrl+C на уровне console control handler
-    def _on_ctrl(_ctrl_type: int):
+def _selfplay_worker(worker_id: int, request_q, response_q, data_q, stop_event: mp.Event):
+    """Worker process: generate self-play games and push them to data_q."""
+    # Workers must NOT react to Ctrl+C; the main process coordinates shutdown.
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
+
+    _install_windows_console_ctrl_ignore()
+
+    try:
+        infer_client = InferenceClient(request_q, response_q, worker_id=worker_id)
+        dummy = AlphaZeroNet()  # only to satisfy signature; weights not used in worker
+
+        while not stop_event.is_set():
+            try:
+                data, outcome, plies = self_play_game(
+                    model=dummy,
+                    infer_client=infer_client,
+                    worker_id=worker_id,
+                    max_moves=MAX_GAME_LENGTH,
+                )
+                data_q.put((data, outcome, plies), block=True)
+            except Exception:
+                traceback.print_exc()
+                time.sleep(0.5)
+    except KeyboardInterrupt:
+        return
+
+
+def _eval_worker(task_q, result_q):
+    """Separate process: arena eval candidate vs best, with progress reports."""
+    _install_windows_console_ctrl_ignore()
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except Exception:
+        pass
+
+    while True:
+        task = task_q.get()
+        if task is None:
+            return
+
+        eval_id = task.get("eval_id", 0)
+        best_path = task["best_path"]
+        cand_path = task["candidate_path"]
+        num_games = int(task["num_games"])
+        device = task.get("device", "cpu")
+        mcts_sims = int(task.get("mcts_sims", MCTS_SIMULATIONS))
+        progress_every = int(task.get("progress_every", 5))
+
+        t0 = time.time()
         try:
-            stop_event.set()
-        except Exception:
-            pass
+            device_t = torch.device(device)
 
-    _install_windows_ctrl_handler(_on_ctrl)
+            best = AlphaZeroNet().to(device_t)
+            cand = AlphaZeroNet().to(device_t)
 
-    model = CNNActorCritic().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+            best.load_state_dict(torch.load(best_path, map_location=device_t))
+            cand.load_state_dict(torch.load(cand_path, map_location=device_t))
 
+            best.eval()
+            cand.eval()
+
+            wins = draws = losses = 0
+            total_plies = 0
+
+            for g in range(num_games):
+                # Alternate colors to reduce first-move bias.
+                if g % 2 == 0:
+                    outcome, plies, _term = play_game_models(
+                        model_white=cand,
+                        model_black=best,
+                        max_moves=MAX_GAME_LENGTH,
+                        mcts_sims=mcts_sims,
+                    )
+                    cand_is_white = True
+                else:
+                    outcome, plies, _term = play_game_models(
+                        model_white=best,
+                        model_black=cand,
+                        max_moves=MAX_GAME_LENGTH,
+                        mcts_sims=mcts_sims,
+                    )
+                    cand_is_white = False
+
+                total_plies += int(plies)
+
+                # Candidate perspective
+                if outcome is None or outcome.winner is None:
+                    draws += 1
+                else:
+                    cand_won = (outcome.winner == chess.WHITE and cand_is_white) or (
+                        outcome.winner == chess.BLACK and (not cand_is_white)
+                    )
+                    if cand_won:
+                        wins += 1
+                    else:
+                        losses += 1
+
+                done = g + 1
+                if (done % progress_every == 0) or (done == num_games):
+                    score = (wins + 0.5 * draws) / max(1, wins + draws + losses)
+                    score_lb = score_lower_bound_from_counts(wins, draws, losses, z=EVAL_SCORE_Z)
+                    elo = elo_diff_from_score(score)
+                    result_q.put(
+                        {
+                            "type": "eval_progress",
+                            "eval_id": eval_id,
+                            "done": done,
+                            "num_games": num_games,
+                            "wins": wins,
+                            "draws": draws,
+                            "losses": losses,
+                            "score": float(score),
+                            "score_lb": float(score_lb),
+                            "elo_diff": float(elo),
+                            "elapsed_s": float(time.time() - t0),
+                            "mcts_sims": mcts_sims,
+                        }
+                    )
+
+            score = (wins + 0.5 * draws) / max(1, wins + draws + losses)
+            score_lb = score_lower_bound_from_counts(wins, draws, losses, z=EVAL_SCORE_Z)
+            elo = elo_diff_from_score(score)
+            avg_plies = total_plies / max(1, num_games)
+
+            result_q.put(
+                {
+                    "type": "eval_done",
+                    "eval_id": eval_id,
+                    "ok": True,
+                    "res": {
+                        "games": num_games,
+                        "wins": wins,
+                        "draws": draws,
+                        "losses": losses,
+                        "score": float(score),
+                        "score_lb": float(score_lb),
+                        "elo_diff": float(elo),
+                        "avg_plies": float(avg_plies),
+                        "elapsed_s": float(time.time() - t0),
+                        "mcts_sims": mcts_sims,
+                        "best_path": best_path,
+                        "candidate_path": cand_path,
+                    },
+                }
+            )
+
+        except Exception as e:
+            result_q.put(
+                {
+                    "type": "eval_done",
+                    "eval_id": eval_id,
+                    "ok": False,
+                    "err": str(e),
+                    "trace": traceback.format_exc(),
+                }
+            )
+
+
+def main():
+    mp.freeze_support()
+
+    # On Windows it's safer to enforce spawn explicitly.
+    try:
+        mp.set_start_method("spawn", force=True)
+    except Exception:
+        pass
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # Ensure dirs exist
+    _ensure_parent_dir(CHECKPOINT_PATH)
+    _ensure_parent_dir(BEST_CHECKPOINT_PATH)
+    _ensure_parent_dir(REPLAY_PATH)
+    _ensure_parent_dir(EVAL_CANDIDATE_PATH)
+    os.makedirs(EVAL_TMP_DIR, exist_ok=True)
+
+    # Candidate model
+    model = AlphaZeroNet().to(device)
     if os.path.exists(CHECKPOINT_PATH):
-        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
-        print(f"Loaded checkpoint: {CHECKPOINT_PATH}")
+        try:
+            model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
+            print(f"Loaded candidate checkpoint: {CHECKPOINT_PATH}")
+        except Exception:
+            print("WARNING: failed to load candidate checkpoint, starting fresh.")
+            traceback.print_exc()
 
-    if load_replay_buffer(DEFAULT_REPLAY_PATH):
-        print(f"Loaded replay buffer: {DEFAULT_REPLAY_PATH}")
-    else:
-        print("Replay buffer not found (starting empty).")
+    model.eval()
 
+    # Ensure baseline exists
+    if not os.path.exists(BEST_CHECKPOINT_PATH):
+        if os.path.exists(CHECKPOINT_PATH):
+            _atomic_torch_save(torch.load(CHECKPOINT_PATH, map_location="cpu"), BEST_CHECKPOINT_PATH)
+        else:
+            _atomic_torch_save(model.state_dict(), BEST_CHECKPOINT_PATH)
+        print(f"Initialized baseline: {BEST_CHECKPOINT_PATH}")
+
+    # Replay buffer (singleton)
+    if load_replay_buffer(REPLAY_PATH):
+        print(f"Loaded replay buffer: {REPLAY_PATH}")
     rb = get_replay_buffer()
     print("Replay sizes:", rb.sizes())
 
-    request_q = mp.Queue(maxsize=NUM_SELFPLAY_WORKERS * 8)
-    response_queues = [mp.Queue(maxsize=NUM_SELFPLAY_WORKERS * 8) for _ in range(NUM_SELFPLAY_WORKERS)]
-    data_q = mp.Queue(maxsize=NUM_SELFPLAY_WORKERS * 4)
-    log_q = mp.Queue(maxsize=NUM_SELFPLAY_WORKERS * 256)
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
+    # Multiprocessing comms
+    stop_event = mp.Event()
+    _install_sigint_handler(stop_event)
+
+    request_q = mp.Queue(maxsize=NUM_SELFPLAY_WORKERS * 16)
+    response_qs = [mp.Queue(maxsize=NUM_SELFPLAY_WORKERS * 16) for _ in range(NUM_SELFPLAY_WORKERS)]
+    data_q = mp.Queue(maxsize=NUM_SELFPLAY_WORKERS * 8)
+
+    # Eval process
+    eval_task_q = mp.Queue(maxsize=8)
+    eval_result_q = mp.Queue(maxsize=32)
+    eval_proc = mp.Process(target=_eval_worker, args=(eval_task_q, eval_result_q), daemon=True)
+    eval_proc.start()
+
+    # Self-play workers
     workers = []
-    base_seed = int(time.time()) & 0xFFFF_FFFF
     for wid in range(NUM_SELFPLAY_WORKERS):
         p = mp.Process(
             target=_selfplay_worker,
-            args=(wid, request_q, response_queues[wid], data_q, log_q, stop_event, base_seed + wid),
+            args=(wid, request_q, response_qs[wid], data_q, stop_event),
             daemon=True,
         )
         p.start()
         workers.append(p)
+    print(f"Started {NUM_SELFPLAY_WORKERS} self-play workers.")
 
-    print(f"Started {len(workers)} self-play workers.")
-
+    # Stats
     games_seen = 0
-    train_budget = 0
+    mates = 0
+    draws = 0
+    served_pos_5s = 0
+    last_tick = time.time()
 
-    games_mate = 0
-    games_draw = 0
-    games_white = 0
-    games_black = 0
+    last_100_finish_ts: list[float] = []
 
-    # ✅ времена завершения последних 100 игр -> считаем GPM по ним
-    last_finish_ts = deque(maxlen=100)
-
-    served_positions_since_log = 0
-    train_steps_since_log = 0
-    last_log_t = time.time()
-
-    stopping_printed = False
+    # Evaluation state (gating)
+    eval_in_flight = False
+    eval_id_counter = 0
+    eval_started_ts: float | None = None
+    eval_last_progress_ts = 0.0
+    last_eval_at_games = -10**9
 
     try:
         while not stop_event.is_set():
-            did_work = False
+            # --------------------------
+            # Central inference server
+            # --------------------------
+            batch = []
+            meta = []
+            t_batch_start = time.time()
 
-            # drain worker logs
-            for _ in range(200):
-                try:
-                    msg = log_q.get_nowait()
-                except _py_queue.Empty:
+            while len(batch) < SERVER_MAX_INFERENCE_POSITIONS:
+                timeout = max(0.0, SERVER_BATCH_TIMEOUT_S - (time.time() - t_batch_start))
+                if timeout == 0.0 and batch:
                     break
-                print(msg)
-                did_work = True
-
-            # detect dead workers
-            for i, p in enumerate(workers):
-                if not p.is_alive() and not stop_event.is_set():
-                    print(f"[main] worker[{i}] died. exitcode={p.exitcode}")
-                    stop_event.set()
-                    raise RuntimeError("a worker died")
-
-            # pull finished games
-            for _ in range(int(SERVER_DRAIN_GAMES_PER_TICK)):
                 try:
-                    obs, pi, z, is_mate, winner, termination = data_q.get_nowait()
-                except _py_queue.Empty:
+                    rid, obs = request_q.get(timeout=timeout)
+                    batch.append(obs)
+                    meta.append(rid)
+                except queue.Empty:
                     break
 
-                # фиксируем время завершения игры
-                last_finish_ts.append(time.time())
+            if batch:
+                with torch.no_grad():
+                    x = torch.from_numpy(np.stack(batch, axis=0)).to(device)
+                    pol, val = model(x)
+                    pol = pol.detach().cpu().numpy().astype(np.float32)
+                    val = val.detach().cpu().numpy().astype(np.float32).reshape(-1)
 
-                if bool(is_mate):
-                    rb.mate.add_many((obs, pi, z))
-                    games_mate += 1
-                    if int(winner) == 1:
-                        games_white += 1
-                    elif int(winner) == -1:
-                        games_black += 1
-                else:
-                    rb.draw.add_many((obs, pi, z))
-                    games_draw += 1
+                # route responses by worker_id embedded in rid (upper 16 bits)
+                for rid, logits, v in zip(meta, pol, val):
+                    worker_id = int(rid >> 48)
+                    response_qs[worker_id].put((rid, logits, float(v)), block=True)
 
+                served_pos_5s += len(batch)
+
+            # --------------------------
+            # Drain finished games
+            # --------------------------
+            drained = 0
+            while drained < SERVER_DRAIN_GAMES_PER_TICK:
+                try:
+                    data, outcome, plies = data_q.get_nowait()
+                except queue.Empty:
+                    break
+
+                drained += 1
                 games_seen += 1
-                train_budget += int(SERVER_TRAIN_STEPS_PER_GAME)
-                did_work = True
 
-                res = "MATE" if bool(is_mate) else "DRAW"
-                who = "W" if int(winner) == 1 else ("B" if int(winner) == -1 else "-")
-                print(
-                    f"[game] #{games_seen} result={res} winner={who} termination={termination} "
-                    f"positions={len(z)} gpm_100={_gpm_100(last_finish_ts):.2f}"
-                )
-
-                if SAVE_MODEL_PER_GAMES and games_seen % int(SAVE_MODEL_PER_GAMES) == 0:
-                    torch.save(model.state_dict(), CHECKPOINT_PATH)
-                    print(f"[save] model -> {CHECKPOINT_PATH} (games={games_seen})")
-
-                if SAVE_BUFFER_PER_GAMES and games_seen % int(SAVE_BUFFER_PER_GAMES) == 0:
-                    save_replay_buffer(DEFAULT_REPLAY_PATH)
-                    print(f"[save] buffer -> {DEFAULT_REPLAY_PATH} (games={games_seen})")
-
-            # serve inference
-            reqs = _collect_inference_requests(
-                request_q,
-                max_total_positions=int(SERVER_MAX_INFERENCE_POSITIONS),
-                wait_ms=int(SERVER_INFERENCE_WAIT_MS),
-            )
-            if reqs:
-                served = _serve_inference_batch(model, device, reqs, response_queues)
-                served_positions_since_log += served
-                did_work = True
-
-            # training (как было: учимся только если в этот тик нет inference запросов)
-            if train_budget > 0 and not reqs:
-                s = train_one_step(model, optimizer, device=device)
-                if s.get("did_step"):
-                    train_budget -= 1
-                    train_steps_since_log += 1
-                    did_work = True
+                # outcome stats (mate vs draw-ish)
+                if outcome is not None and outcome.winner is not None and outcome.termination == chess.Termination.CHECKMATE:
+                    mates += 1
                 else:
-                    train_budget = 0
+                    draws += 1
 
-            if time.time() - last_log_t > 5.0:
-                last_log_t = time.time()
-                alive = sum(1 for p in workers if p.is_alive())
-                gpm100 = _gpm_100(last_finish_ts)
+                last_100_finish_ts.append(time.time())
+                if len(last_100_finish_ts) > 100:
+                    last_100_finish_ts = last_100_finish_ts[-100:]
 
+                rb.add_game(data, outcome)
+
+                # periodic persistence
+                if games_seen % SAVE_MODEL_PER_GAMES == 0:
+                    _atomic_torch_save(model.state_dict(), CHECKPOINT_PATH)
+
+                if games_seen % SAVE_BUFFER_PER_GAMES == 0:
+                    save_replay_buffer(REPLAY_PATH)
+
+                # schedule evaluation
+                if (not eval_in_flight) and (games_seen - last_eval_at_games >= EVAL_EVERY_GAMES):
+                    # Snapshot candidate weights for evaluation so training can continue in parallel.
+                    _atomic_torch_save(model.state_dict(), EVAL_CANDIDATE_PATH)
+
+                    eval_id_counter += 1
+                    eval_started_ts = time.time()
+                    eval_last_progress_ts = eval_started_ts
+
+                    eval_task_q.put(
+                        {
+                            "type": "eval",
+                            "eval_id": eval_id_counter,
+                            "best_path": BEST_CHECKPOINT_PATH,
+                            "candidate_path": EVAL_CANDIDATE_PATH,
+                            "num_games": EVAL_NUM_GAMES,
+                            # Keep eval on CPU so it doesn't steal GPU from self-play/training
+                            "device": "cpu",
+                            "mcts_sims": EVAL_MCTS_SIMULATIONS,
+                            "progress_every": 5,
+                        }
+                    )
+                    eval_in_flight = True
+                    last_eval_at_games = games_seen
+
+                    print(
+                        f"[eval] scheduled @ {time.strftime('%H:%M:%S')}: "
+                        f"games={games_seen} num={EVAL_NUM_GAMES} mcts_sims={MCTS_SIMULATIONS} "
+                        f"best='{BEST_CHECKPOINT_PATH}' cand='{EVAL_CANDIDATE_PATH}' "
+                        f"promote_if_score_lb>={EVAL_PROMOTE_SCORE} (z={EVAL_SCORE_Z})"
+                    )
+
+            # --------------------------
+            # Training steps (bounded)
+            # --------------------------
+            if drained > 0 and len(rb) >= max(MIN_REPLAY_SIZE, BATCH_SIZE):
+                steps = int(TRAIN_STEPS_PER_GAME) * drained
+                # keep inference responsive even if drained is large
+                steps = min(steps, 64)
+
+                model.train()
+                for _ in range(steps):
+                    obs_t, pi_t, z_t = rb.sample_torch(BATCH_SIZE, device=device)
+                    _ = train_one_step(model, optimizer, (obs_t, pi_t, z_t))
+                model.eval()
+
+            # --------------------------
+            # Collect eval results / progress (gating)
+            # --------------------------
+            while True:
+                try:
+                    msg = eval_result_q.get_nowait()
+                except queue.Empty:
+                    break
+
+                mtype = msg.get("type", "")
+                if mtype == "eval_progress":
+                    done = int(msg.get("done", 0))
+                    num_games = int(msg.get("num_games", 0))
+                    w = int(msg.get("wins", 0))
+                    d = int(msg.get("draws", 0))
+                    l = int(msg.get("losses", 0))
+                    score = float(msg.get("score", 0.0))
+                    score_lb = float(msg.get("score_lb", 0.0))
+                    elo = float(msg.get("elo_diff", 0.0))
+                    elapsed = float(msg.get("elapsed_s", 0.0))
+                    sims = int(msg.get("mcts_sims", EVAL_MCTS_SIMULATIONS))
+
+                    eval_last_progress_ts = time.time()
+                    print(
+                        f"[eval] progress id={msg.get('eval_id', '?')} "
+                        f"{done}/{num_games} W/D/L={w}/{d}/{l} "
+                        f"score={score:.3f} score_lb={score_lb:.3f} elo={elo:+.1f} "
+                        f"elapsed={elapsed:.1f}s sims={sims}"
+                    )
+                    continue
+
+                if mtype == "eval_done":
+                    ok = bool(msg.get("ok", False))
+                    eval_in_flight = False
+                    eval_started_ts = None
+
+                    if not ok:
+                        print(f"[eval] ERROR id={msg.get('eval_id', '?')}: {msg.get('err', 'unknown error')}")
+                        tr = msg.get("trace")
+                        if tr:
+                            print(tr)
+                        continue
+
+                    res = msg.get("res", {})
+                    w = int(res.get("wins", 0))
+                    d = int(res.get("draws", 0))
+                    l = int(res.get("losses", 0))
+                    games_eval = int(res.get("games", 0))
+                    score = float(res.get("score", 0.0))
+                    score_lb = float(res.get("score_lb", 0.0))
+                    elo = float(res.get("elo_diff", 0.0))
+                    avg_plies = float(res.get("avg_plies", 0.0))
+                    elapsed = float(res.get("elapsed_s", 0.0))
+                    sims = int(res.get("mcts_sims", MCTS_SIMULATIONS))
+
+                    promote = (games_eval > 0) and (score_lb >= float(EVAL_PROMOTE_SCORE))
+                    print(
+                        f"[eval] DONE id={msg.get('eval_id', '?')} games={games_eval} sims={sims} "
+                        f"W/D/L={w}/{d}/{l} score={score:.3f} score_lb(z={EVAL_SCORE_Z})={score_lb:.3f} "
+                        f"elo_vs_best={elo:+.1f} avg_plies={avg_plies:.1f} elapsed={elapsed:.1f}s "
+                        f"{'PROMOTE -> best' if promote else 'no promote'}"
+                    )
+
+                    if promote:
+                        try:
+                            old_mtime = os.path.getmtime(BEST_CHECKPOINT_PATH) if os.path.exists(BEST_CHECKPOINT_PATH) else None
+                        except Exception:
+                            old_mtime = None
+
+                        _atomic_torch_save(torch.load(EVAL_CANDIDATE_PATH, map_location="cpu"), BEST_CHECKPOINT_PATH)
+
+                        try:
+                            new_mtime = os.path.getmtime(BEST_CHECKPOINT_PATH)
+                        except Exception:
+                            new_mtime = None
+
+                        print(
+                            f"[eval] PROMOTED @ {time.strftime('%H:%M:%S')}: "
+                            f"best updated -> {BEST_CHECKPOINT_PATH} (from {EVAL_CANDIDATE_PATH}); "
+                            f"score={score:.3f} score_lb={score_lb:.3f} elo={elo:+.1f} "
+                            f"mtime {old_mtime} -> {new_mtime}"
+                        )
+                    continue
+
+                print(f"[eval] WARNING: unknown message: {msg}")
+
+            # If eval is running and we haven't heard from it in a while, say so.
+            if eval_in_flight and eval_started_ts is not None:
+                now = time.time()
+                if now - float(eval_last_progress_ts) > 60.0:
+                    print(
+                        f"[eval] still running... elapsed={now - float(eval_started_ts):.1f}s "
+                        f"(no progress messages for {now - float(eval_last_progress_ts):.1f}s)"
+                    )
+                    eval_last_progress_ts = now
+
+            # --------------------------
+            # Tick log
+            # --------------------------
+            now = time.time()
+            if now - last_tick >= SERVER_TICK_EVERY_S:
+                gpm = 0.0
+                if len(last_100_finish_ts) >= 2:
+                    dt = last_100_finish_ts[-1] - last_100_finish_ts[0]
+                    if dt > 0:
+                        gpm = (len(last_100_finish_ts) / dt) * 60.0
+
+                eval_elapsed = (now - float(eval_started_ts)) if (eval_in_flight and eval_started_ts is not None) else 0.0
                 print(
-                    f"[tick] games={games_seen} train_budget={train_budget} alive_workers={alive} "
-                    f"rq={_try_qsize(request_q)} dq={_try_qsize(data_q)} "
-                    f"served_pos_5s={served_positions_since_log} train_steps_5s={train_steps_since_log} "
-                    f"gpm_100={gpm100:.2f} "
-                    f"mates={games_mate} draws={games_draw} (W={games_white},B={games_black}) "
-                    f"sizes={rb.sizes()}"
+                    f"[tick] games={games_seen} mates={mates} draws={draws} "
+                    f"infer_pos/5s={served_pos_5s} gpm(100)={gpm:.1f} "
+                    f"eval_in_flight={eval_in_flight} eval_elapsed={eval_elapsed:.1f}s "
+                    f"replay={rb.sizes()}"
                 )
-                served_positions_since_log = 0
-                train_steps_since_log = 0
-
-            if not did_work:
-                time.sleep(float(SERVER_IDLE_SLEEP_MS) / 1000.0)
-
-        stopping_printed = True
-        print("\nStopping (Ctrl+C)...")
+                served_pos_5s = 0
+                last_tick = now
 
     except KeyboardInterrupt:
-        if not stopping_printed:
-            print("\nStopping (KeyboardInterrupt)...")
         stop_event.set()
-
     finally:
         stop_event.set()
 
-        for p in workers:
-            if p.is_alive():
-                p.join(timeout=2.0)
-
-        for p in workers:
-            if p.is_alive():
-                try:
-                    p.terminate()
-                except Exception:
-                    pass
-                p.join(timeout=2.0)
-
+        # Stop eval process
         try:
-            torch.save(model.state_dict(), CHECKPOINT_PATH)
-            print(f"Final model saved to {CHECKPOINT_PATH}")
-        except Exception as e:
-            print(f"[warn] failed to save model: {e}")
-
+            eval_task_q.put(None)
+        except Exception:
+            pass
         try:
-            save_replay_buffer(DEFAULT_REPLAY_PATH)
-            print(f"Final replay buffer saved to {DEFAULT_REPLAY_PATH}")
-        except Exception as e:
-            print(f"[warn] failed to save buffer: {e}")
+            eval_proc.join(timeout=2.0)
+        except Exception:
+            pass
+
+        # Workers are daemons; still try to join briefly for cleanliness.
+        for p in workers:
+            try:
+                p.join(timeout=1.0)
+            except Exception:
+                pass
+
+        # Persist state
+        try:
+            _atomic_torch_save(model.state_dict(), CHECKPOINT_PATH)
+        except Exception:
+            pass
+        try:
+            save_replay_buffer(REPLAY_PATH)
+        except Exception:
+            pass
+
+        print("Done.")
 
 
 if __name__ == "__main__":
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    main(device=dev)
+    main()

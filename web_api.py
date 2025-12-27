@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from constants import CHECKPOINT_PATH, LAST_POSITIONS, WEB_MCTS_SIMULATIONS
 from env import board_to_planes
-from nw import CNNActorCritic
+from nw import AlphaZeroNet as CNNActorCritic
 from agent import MCTS
 
 
