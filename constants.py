@@ -68,7 +68,7 @@ P_MATE_IN_BATCH = 0.5
 WEB_MCTS_SIMULATIONS = 1600
 
 # ================== Multi-process + Central inference server ==================
-NUM_SELFPLAY_WORKERS = 12
+NUM_SELFPLAY_WORKERS = 16
 
 # DEBUG: маленькие батчи на сервере
 SERVER_MAX_INFERENCE_POSITIONS = 128
