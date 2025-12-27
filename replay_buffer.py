@@ -26,21 +26,20 @@ class ReplayBuffer:
 
     def __init__(self, capacity: int):
         self.capacity = int(capacity)
-
         self.obs = np.zeros((self.capacity, TOTAL_LAYERS, 8, 8), dtype=np.float32)
         self.pi = np.zeros((self.capacity, TOTAL_MOVES), dtype=np.float32)
         self.z = np.zeros((self.capacity,), dtype=np.float32)
-
         self.idx = 0
         self.sz = 0
 
-    def __len__(self) -> int:
+    def __len__(self):
         return int(self.sz)
 
     def add_many(self, data: List[Tuple[np.ndarray, np.ndarray, float]]):
         if not data:
             return
 
+        # поддерживаем как list[(obs,pi,z)], так и (obs_batch,pi_batch,z_batch)
         if (
             isinstance(data, tuple)
             and len(data) == 3
@@ -59,6 +58,7 @@ class ReplayBuffer:
         if n == 0:
             return
 
+        # если прислали больше capacity — возьмём хвост
         if n > self.capacity:
             obs_batch = obs_batch[-self.capacity:]
             pi_batch = pi_batch[-self.capacity:]
@@ -90,19 +90,34 @@ class ReplayBuffer:
         Вызывать только если self.sz >= batch_size.
         """
         if self.sz < batch_size:
-            raise ValueError(f"ReplayBuffer: not enough data to sample_exact({batch_size}), sz={self.sz}")
+            raise ValueError(
+                f"ReplayBuffer: not enough data to sample_exact({batch_size}), sz={self.sz}"
+            )
 
-        indices = np.random.choice(self.sz, size=batch_size, replace=False)
-        return self.obs[indices], self.pi[indices], self.z[indices]
+        idxs = np.random.choice(self.sz, size=batch_size, replace=False)
+        return self.obs[idxs], self.pi[idxs], self.z[idxs]
+
+    def sample(self, batch_size: int):
+        """
+        Как и в твоём старом коде:
+        если данных меньше batch_size — вернём сколько есть (без ошибок).
+        """
+        batch_size = int(batch_size)
+        if self.sz == 0:
+            raise ValueError("ReplayBuffer пуст, нечего sample'ить")
+        if self.sz <= batch_size:
+            idxs = np.random.choice(self.sz, size=self.sz, replace=False)
+        else:
+            idxs = np.random.choice(self.sz, size=batch_size, replace=False)
+        return self.obs[idxs], self.pi[idxs], self.z[idxs]
 
 
 class DualReplayBuffer:
     """
-    Два буфера:
-      - mate_buffer: позиции из партий, закончившихся checkmate
-      - draw_buffer: позиции из остальных партий (draw / exceeded move limit / etc)
-
-    sample(batch_size) возвращает смешанный batch:
+    Stratified replay:
+      - mate_buffer: позиции из партий, которые закончились CHECKMATE
+      - draw_buffer: остальные (draw/other)
+    sample(batch_size, p_mate):
       k ~ round(batch_size * p_mate) из mate_buffer
       batch_size-k из draw_buffer
       затем shuffle.
@@ -119,7 +134,7 @@ class DualReplayBuffer:
         self.mate = ReplayBuffer(mate_cap)
         self.draw = ReplayBuffer(draw_cap)
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.mate) + len(self.draw)
 
     def sizes(self) -> dict:
@@ -151,54 +166,55 @@ class DualReplayBuffer:
 
         total = len(self)
         if total < batch_size:
-            # как и в твоём старом буфере: если мало данных, отдадим сколько есть
             batch_size = total
 
         m = len(self.mate)
         d = len(self.draw)
 
         # хотим k из mate
-        k_desired = int(round(batch_size * p_mate))
-        k = min(k_desired, m)
-        rest = batch_size - k
+        k = int(round(batch_size * p_mate))
 
-        # добираем из draw
-        take_d = min(rest, d)
-        rest2 = rest - take_d
-
-        # если draw не хватило, докидываем из mate (гарантировано хватит, т.к. total >= batch_size)
-        take_m2 = rest2
-        k_total = k + take_m2
+        # зажимаем по наличию данных
+        if m == 0:
+            k = 0
+        elif d == 0:
+            k = batch_size
+        else:
+            k = max(0, min(k, batch_size))
+            k = min(k, m)
+            k = max(k, batch_size - d)
 
         parts = []
-        if k_total > 0:
-            obs_m, pi_m, z_m = self.mate.sample_exact(k_total)
-            parts.append((obs_m, pi_m, z_m))
+        if k > 0:
+            parts.append(self.mate.sample(k))
+        if batch_size - k > 0:
+            parts.append(self.draw.sample(batch_size - k))
 
-        if take_d > 0:
-            obs_d, pi_d, z_d = self.draw.sample_exact(take_d)
-            parts.append((obs_d, pi_d, z_d))
+        if not parts:
+            raise ValueError("DualReplayBuffer: странное состояние, parts пуст")
 
         obs = np.concatenate([p[0] for p in parts], axis=0) if len(parts) > 1 else parts[0][0]
         pi = np.concatenate([p[1] for p in parts], axis=0) if len(parts) > 1 else parts[0][1]
         z = np.concatenate([p[2] for p in parts], axis=0) if len(parts) > 1 else parts[0][2]
 
-        # shuffle внутри batch
         perm = np.random.permutation(obs.shape[0])
         return obs[perm], pi[perm], z[perm]
 
 
-# Глобальный буфер (чтобы agent.py почти не трогать)
-replay_buffer = DualReplayBuffer(REPLAY_CAPACITY, mate_fraction=MATE_BUFFER_FRACTION)
+# ===== lazy singleton buffer (важно для multiprocessing) =====
+_replay_buffer: DualReplayBuffer | None = None
+
+
+def get_replay_buffer() -> DualReplayBuffer:
+    global _replay_buffer
+    if _replay_buffer is None:
+        _replay_buffer = DualReplayBuffer(REPLAY_CAPACITY, mate_fraction=MATE_BUFFER_FRACTION)
+    return _replay_buffer
 
 
 def save_replay_buffer(path: str = DEFAULT_REPLAY_PATH) -> None:
-    """
-    Сохраняем ДВА буфера в один .npz.
-    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    rb = replay_buffer
-
+    rb = get_replay_buffer()
     if len(rb) == 0:
         return
 
@@ -223,40 +239,28 @@ def save_replay_buffer(path: str = DEFAULT_REPLAY_PATH) -> None:
 
 
 def load_replay_buffer(path: str = DEFAULT_REPLAY_PATH) -> bool:
-    """
-    Загружаем новый формат (version=2).
-    """
     if not os.path.exists(path):
         return False
 
     data = np.load(path, allow_pickle=False)
-    rb = replay_buffer
+    rb = get_replay_buffer()
 
-    # ---- новый формат ----
     if "version" in data and int(data["version"]) == 2:
         # mate
-        mate_obs = data["mate_obs"]
-        mate_pi = data["mate_pi"]
-        mate_z = data["mate_z"]
-
         rb.mate.obs[:] = 0
         rb.mate.pi[:] = 0
         rb.mate.z[:] = 0
         rb.mate.sz = 0
         rb.mate.idx = 0
-        rb.mate.add_many((mate_obs, mate_pi, mate_z))
+        rb.mate.add_many((data["mate_obs"], data["mate_pi"], data["mate_z"]))
 
         # draw
-        draw_obs = data["draw_obs"]
-        draw_pi = data["draw_pi"]
-        draw_z = data["draw_z"]
-
         rb.draw.obs[:] = 0
         rb.draw.pi[:] = 0
         rb.draw.z[:] = 0
         rb.draw.sz = 0
         rb.draw.idx = 0
-        rb.draw.add_many((draw_obs, draw_pi, draw_z))
+        rb.draw.add_many((data["draw_obs"], data["draw_pi"], data["draw_z"]))
 
         return True
 
