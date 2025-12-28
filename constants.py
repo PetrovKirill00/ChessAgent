@@ -120,7 +120,7 @@ P_MATE_IN_BATCH = 0.5
 # -----------------------------
 # Multi-process self-play
 # -----------------------------
-NUM_SELFPLAY_WORKERS = 8
+NUM_SELFPLAY_WORKERS = 16
 
 # -----------------------------
 # Central inference server (main process)
