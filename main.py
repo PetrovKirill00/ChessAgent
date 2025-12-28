@@ -20,7 +20,7 @@ Gating (baseline freezing):
   where score = (W + 0.5*D) / N (standard chess score).
 
 Important:
-- Training uses draw contempt (see constants.py).
+- Training targets are WDL; draws are trained as honest draws (no contempt).
 - Evaluation/gating uses the standard chess score (draw=0.5).
 - On Windows, Ctrl+C noise from Intel runtimes (MKL/oneAPI) is silenced via
   FOR_DISABLE_CONSOLE_CTRL_HANDLER=1 set BEFORE importing numpy/torch.
@@ -73,7 +73,7 @@ from constants import (
     EVAL_NUM_GAMES,
     EVAL_PROMOTE_SCORE,
     EVAL_SCORE_Z,
-    MCTS_SIMULATIONS, EVAL_MCTS_SIMULATIONS,
+    MCTS_SIMULATIONS,
 )
 
 from nw import AlphaZeroNet
@@ -418,6 +418,11 @@ def main():
     eval_last_progress_ts = 0.0
     last_eval_at_games = -10**9
 
+    # Promotion bookkeeping (per run).
+    # This answers: "is the agent actually getting better often enough?"
+    promotions_total = 0
+    last_promo_at_games: int | None = None
+
     try:
         while not stop_event.is_set():
             # --------------------------
@@ -441,7 +446,7 @@ def main():
             if batch:
                 with torch.no_grad():
                     x = torch.from_numpy(np.stack(batch, axis=0)).to(device)
-                    pol, val = model(x)
+                    pol, val, _ = model(x)
                     pol = pol.detach().cpu().numpy().astype(np.float32)
                     val = val.detach().cpu().numpy().astype(np.float32).reshape(-1)
 
@@ -502,18 +507,22 @@ def main():
                             "num_games": EVAL_NUM_GAMES,
                             # Keep eval on CPU so it doesn't steal GPU from self-play/training
                             "device": "cpu",
-                            "mcts_sims": EVAL_MCTS_SIMULATIONS,
+                            "mcts_sims": MCTS_SIMULATIONS,
                             "progress_every": 5,
                         }
                     )
                     eval_in_flight = True
                     last_eval_at_games = games_seen
 
+                    games_since_promo = (games_seen - last_promo_at_games) if (last_promo_at_games is not None) else None
+                    since_str = str(games_since_promo) if (games_since_promo is not None) else "never"
+
                     print(
                         f"[eval] scheduled @ {time.strftime('%H:%M:%S')}: "
-                        f"games={games_seen} num={EVAL_NUM_GAMES} mcts_sims={MCTS_SIMULATIONS} "
+                        f"id={eval_id_counter} games={games_seen} num={EVAL_NUM_GAMES} mcts_sims={MCTS_SIMULATIONS} "
                         f"best='{BEST_CHECKPOINT_PATH}' cand='{EVAL_CANDIDATE_PATH}' "
-                        f"promote_if_score_lb>={EVAL_PROMOTE_SCORE} (z={EVAL_SCORE_Z})"
+                        f"promote_if_score_lb>={EVAL_PROMOTE_SCORE} (z={EVAL_SCORE_Z}) "
+                        f"promotions_total={promotions_total} games_since_last_promo={since_str}"
                     )
 
             # --------------------------
@@ -526,8 +535,8 @@ def main():
 
                 model.train()
                 for _ in range(steps):
-                    obs_t, pi_t, z_t = rb.sample_torch(BATCH_SIZE, device=device)
-                    _ = train_one_step(model, optimizer, (obs_t, pi_t, z_t))
+                    obs_t, pi_t, wdl_t = rb.sample_torch(BATCH_SIZE, device=device)
+                    _ = train_one_step(model, optimizer, (obs_t, pi_t, wdl_t))
                 model.eval()
 
             # --------------------------
@@ -550,14 +559,17 @@ def main():
                     score_lb = float(msg.get("score_lb", 0.0))
                     elo = float(msg.get("elo_diff", 0.0))
                     elapsed = float(msg.get("elapsed_s", 0.0))
-                    sims = int(msg.get("mcts_sims", EVAL_MCTS_SIMULATIONS))
+                    sims = int(msg.get("mcts_sims", MCTS_SIMULATIONS))
 
                     eval_last_progress_ts = time.time()
+                    games_since_promo = (games_seen - last_promo_at_games) if (last_promo_at_games is not None) else None
+                    since_str = str(games_since_promo) if (games_since_promo is not None) else "never"
                     print(
                         f"[eval] progress id={msg.get('eval_id', '?')} "
                         f"{done}/{num_games} W/D/L={w}/{d}/{l} "
                         f"score={score:.3f} score_lb={score_lb:.3f} elo={elo:+.1f} "
-                        f"elapsed={elapsed:.1f}s sims={sims}"
+                        f"elapsed={elapsed:.1f}s sims={sims} "
+                        f"promotions_total={promotions_total} games_since_last_promo={since_str}"
                     )
                     continue
 
@@ -586,14 +598,19 @@ def main():
                     sims = int(res.get("mcts_sims", MCTS_SIMULATIONS))
 
                     promote = (games_eval > 0) and (score_lb >= float(EVAL_PROMOTE_SCORE))
+                    games_since_promo = (games_seen - last_promo_at_games) if (last_promo_at_games is not None) else None
+                    since_str = str(games_since_promo) if (games_since_promo is not None) else "never"
                     print(
                         f"[eval] DONE id={msg.get('eval_id', '?')} games={games_eval} sims={sims} "
                         f"W/D/L={w}/{d}/{l} score={score:.3f} score_lb(z={EVAL_SCORE_Z})={score_lb:.3f} "
                         f"elo_vs_best={elo:+.1f} avg_plies={avg_plies:.1f} elapsed={elapsed:.1f}s "
-                        f"{'PROMOTE -> best' if promote else 'no promote'}"
+                        f"{'PROMOTE -> best' if promote else 'no promote'} "
+                        f"promotions_total={promotions_total} games_since_last_promo={since_str}"
                     )
 
                     if promote:
+                        promotions_total += 1
+                        last_promo_at_games = games_seen
                         try:
                             old_mtime = os.path.getmtime(BEST_CHECKPOINT_PATH) if os.path.exists(BEST_CHECKPOINT_PATH) else None
                         except Exception:
@@ -610,7 +627,8 @@ def main():
                             f"[eval] PROMOTED @ {time.strftime('%H:%M:%S')}: "
                             f"best updated -> {BEST_CHECKPOINT_PATH} (from {EVAL_CANDIDATE_PATH}); "
                             f"score={score:.3f} score_lb={score_lb:.3f} elo={elo:+.1f} "
-                            f"mtime {old_mtime} -> {new_mtime}"
+                            f"mtime {old_mtime} -> {new_mtime} "
+                            f"promotions_total={promotions_total} games_since_last_promo=0"
                         )
                     continue
 
@@ -620,9 +638,12 @@ def main():
             if eval_in_flight and eval_started_ts is not None:
                 now = time.time()
                 if now - float(eval_last_progress_ts) > 60.0:
+                    games_since_promo = (games_seen - last_promo_at_games) if (last_promo_at_games is not None) else None
+                    since_str = str(games_since_promo) if (games_since_promo is not None) else "never"
                     print(
                         f"[eval] still running... elapsed={now - float(eval_started_ts):.1f}s "
-                        f"(no progress messages for {now - float(eval_last_progress_ts):.1f}s)"
+                        f"(no progress messages for {now - float(eval_last_progress_ts):.1f}s) "
+                        f"promotions_total={promotions_total} games_since_last_promo={since_str}"
                     )
                     eval_last_progress_ts = now
 

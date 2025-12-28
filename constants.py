@@ -85,10 +85,10 @@ TEMPERATURE_TAU_END = 0.25
 # -----------------------------
 # Eval/gating uses chess score: win=1, draw=0.5, loss=0.
 # Training can still discourage draws via a small negative value.
-CONTEMPT_AGAINST_DRAW = -0.05
+CONTEMPT_AGAINST_DRAW = 0.0  # deprecated: draws are trained as honest draws
 
 # Stronger penalty specifically for threefold repetition (optional).
-REPETITION_PENALTY = -1.0
+REPETITION_PENALTY = 0.0  # deprecated: draws are trained as honest draws
 
 # If True: claim draw by threefold repetition when checking termination.
 # If False: repetitions won't immediately terminate; games rely on MAX_GAME_LENGTH.
@@ -101,7 +101,7 @@ THREEFOLD = True
 MIN_REPLAY_SIZE = 4096
 
 # How many gradient steps to run per newly finished self-play game.
-TRAIN_STEPS_PER_GAME = 2
+TRAIN_STEPS_PER_GAME = 4
 
 BATCH_SIZE = 1024
 LEARNING_RATE = 2e-4
@@ -120,7 +120,7 @@ P_MATE_IN_BATCH = 0.5
 # -----------------------------
 # Multi-process self-play
 # -----------------------------
-NUM_SELFPLAY_WORKERS = 16
+NUM_SELFPLAY_WORKERS = 12
 
 # -----------------------------
 # Central inference server (main process)

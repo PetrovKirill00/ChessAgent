@@ -362,7 +362,7 @@ class MCTS:
         assert self.model is not None
         with torch.no_grad():
             x = torch.from_numpy(np.stack(obs_list, axis=0)).to(self.device)
-            pol, val = self.model(x)
+            pol, val, _ = self.model(x)
             pol = pol.detach().cpu().numpy().astype(np.float32)
             val = val.detach().cpu().numpy().astype(np.float32).reshape(-1)
         return pol, val
@@ -544,11 +544,13 @@ def self_play_game(
     worker_id: int,
     *,
     max_moves: int,
-) -> Tuple[List[Tuple[np.ndarray, np.ndarray, float]], chess.Outcome, int]:
+) -> Tuple[List[Tuple[np.ndarray, np.ndarray, int]], chess.Outcome, int]:
     """Generate one self-play game.
 
     Returns:
-        data: list[(obs, pi_vec, z)]
+        data: list[(obs, pi_vec, wdl)]
+            wdl is from the perspective of the side-to-move at `obs`:
+                0 = WIN, 1 = DRAW, 2 = LOSS
         outcome: chess.Outcome
         plies: number of half-moves played
     """
@@ -590,7 +592,7 @@ def self_play_game(
             probs = apply_temperature(probs, tau=tau)
             move = np.random.choice(moves_list, p=probs)
 
-        # Store player-to-move to assign +/- z later.
+        # Store player-to-move to assign WDL later.
         trajectory.append((obs, pi_vec, board.turn))
 
         board.push(move)
@@ -602,20 +604,19 @@ def self_play_game(
         # forced stop -> treat as draw
         outcome = chess.Outcome(termination=chess.Termination.VARIANT_DRAW, winner=None)
 
-    # Build (obs,pi,z) training tuples with draw shaping.
-    data: List[Tuple[np.ndarray, np.ndarray, float]] = []
+    # Build (obs,pi,wdl) tuples WITHOUT any draw shaping: draws are honest draws.
+    data: List[Tuple[np.ndarray, np.ndarray, int]] = []
     if outcome.winner is None:
-        if outcome.termination == chess.Termination.THREEFOLD_REPETITION:
-            z_draw = float(REPETITION_PENALTY)
-        else:
-            z_draw = float(CONTEMPT_AGAINST_DRAW)
         for obs, pi_vec, _player in trajectory:
-            data.append((obs, pi_vec, z_draw))
+            data.append((obs, pi_vec, 1))  # DRAW
     else:
-        z_white = 1.0 if outcome.winner == chess.WHITE else -1.0
-        for obs, pi_vec, player in trajectory:
-            z = z_white if player == chess.WHITE else -z_white
-            data.append((obs, pi_vec, float(z)))
+        winner_is_white = (outcome.winner == chess.WHITE)
+        for obs, pi_vec, player_is_white in trajectory:
+            # perspective of side-to-move at this position
+            if bool(player_is_white) == bool(winner_is_white):
+                data.append((obs, pi_vec, 0))  # WIN
+            else:
+                data.append((obs, pi_vec, 2))  # LOSS
 
     return data, outcome, moves_cnt
 
@@ -628,19 +629,21 @@ def train_one_step(
     optimizer: torch.optim.Optimizer,
     batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> float:
-    """One SGD step on a batch sampled from replay."""
+    """One SGD step on a batch sampled from replay.
+
+    Value target is WDL (win/draw/loss) from the perspective of the side-to-move:
+      0 = WIN, 1 = DRAW, 2 = LOSS
+    """
     model.train()
-    obs, pi, z = batch  # obs:(B,C,8,8), pi:(B,A), z:(B,)
+    obs, pi, wdl = batch  # obs:(B,C,8,8), pi:(B,A), wdl:(B,)
 
-    logits, pred_v = model(obs)
+    policy_logits, _value_scalar, wdl_logits = model(obs)
 
-    logp = F.log_softmax(logits, dim=1)
+    logp = F.log_softmax(policy_logits, dim=1)
     loss_pi = -(pi * logp).sum(dim=1).mean()
 
-        # `AlphaZeroNet.forward()` returns `values` as shape (B,) (see nw.py: `.squeeze(-1)`).
-    # Older variants returned (B, 1); keep this robust to both.
-    pred_v = pred_v.squeeze(-1)  # (B,1)->(B,) ; (B,)->(B,)
-    loss_v = torch.mean((pred_v - z) ** 2)
+    wdl_target = wdl.to(torch.long)
+    loss_v = F.cross_entropy(wdl_logits, wdl_target)
 
     loss = loss_pi + loss_v
 

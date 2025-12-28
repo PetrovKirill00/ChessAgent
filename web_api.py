@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -66,6 +67,41 @@ else:
 
 mcts = MCTS(model=model, device=device)
 
+
+
+def _mcts_run(board: chess.Board, history):
+    """Compatibility wrapper for MCTS.run() used by the web UI.
+
+    Your project has had multiple MCTS.run() signatures across versions.
+    The web API shouldn't care about the exact keyword names.
+
+    Strategy:
+    - Pass `history` as the *second positional* argument to avoid mismatch between
+      `position_history` and `position_deque`.
+    - Pass only kwargs that exist in the current signature (inspect.signature).
+    """
+    sig = inspect.signature(mcts.run)
+    params = sig.parameters
+
+    kwargs = {}
+
+    if "add_dirichlet_noise" in params:
+        kwargs["add_dirichlet_noise"] = False
+
+    # Reuse tree between subsequent UI calls, if supported.
+    if "reuse_tree" in params:
+        kwargs["reuse_tree"] = True
+
+    # Simulation count parameter names vary across versions.
+    if "number_of_simulations" in params:
+        kwargs["number_of_simulations"] = WEB_MCTS_SIMULATIONS
+    elif "mcts_sims" in params:
+        kwargs["mcts_sims"] = WEB_MCTS_SIMULATIONS
+    elif "num_simulations" in params:
+        kwargs["num_simulations"] = WEB_MCTS_SIMULATIONS
+
+    # NOTE: keep calling the underlying method here, not the wrapper.
+    return mcts.run(board, history, **kwargs)
 
 # -------- schemas --------
 class NewGameRequest(BaseModel):
@@ -172,10 +208,7 @@ def new_game(req: NewGameRequest):
 
     # Если человек играет чёрными — движок делает первый ход сразу
     if human_bool == chess.BLACK:
-        mv, _policy = mcts.run(board,
-                               position_history=game.history,
-                               add_dirichlet_noise=False,
-                               number_of_simulations=WEB_MCTS_SIMULATIONS)
+        mv, _policy = _mcts_run(board, game.history)
         if mv is None:
             raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
         _save_move(game, board, mv)
@@ -252,10 +285,7 @@ def make_move(req: MoveRequest):
         )
 
     # ход движка
-    engine_move, _policy = mcts.run(board,
-                                    position_history=game.history,
-                                    add_dirichlet_noise=False,
-                                    number_of_simulations=WEB_MCTS_SIMULATIONS)
+    engine_move, _policy = _mcts_run(board, game.history)
     if engine_move is None:
         raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
 
@@ -295,10 +325,7 @@ def engine_move(req: EngineMoveRequest):
     if board.turn == human_bool:
         raise HTTPException(status_code=400, detail="Сейчас ход человека, движок ходить не должен")
 
-    mv, _policy = mcts.run(board,
-                           position_history=game.history,
-                           add_dirichlet_noise=False,
-                           number_of_simulations=WEB_MCTS_SIMULATIONS)
+    mv, _policy = _mcts_run(board, game.history)
     if mv is None:
         raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
 
