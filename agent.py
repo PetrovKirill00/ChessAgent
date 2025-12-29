@@ -1,801 +1,600 @@
 # agent.py
 # -*- coding: utf-8 -*-
-"""Self-play, MCTS and evaluation utilities.
-
-This file is intentionally self-contained: it includes
-- observation encoding (board -> 102x8x8)
-- action encoding (move -> index in [0..4671])
-- MCTS (with transposition table + optional batched inference)
-- self-play game generation
-- single training step (policy + value losses)
-- candidate-vs-baseline evaluation used for gating.
-
-The *_working.py version had a correct MCTS (tree actually grows).
-The previous "new" version regressed into a 1-ply search because
-leaf expansions were not attached to the tree. This file restores the
-working MCTS logic and keeps the newer gating metric (score with draw=0.5).
-"""
 
 from __future__ import annotations
 
 import math
 import random
 import collections
-from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import chess
-import chess.polyglot
 
-from constants import (
-    # encoding
-    TOTAL_LAYERS, TOTAL_MOVES, LAST_POSITIONS,
-    # mcts
-    MCTS_SIMULATIONS, MCTS_C_PUCT, DIRICHLET_ALPHA, DIRICHLET_EPS, INFERENCE_BATCH_SIZE,
-    TEMPERATURE_MOVES, TEMPERATURE_TAU_START, TEMPERATURE_TAU_END,
-    # training shaping
-    THREEFOLD,
-    # eval/gating
-    EVAL_SCORE_Z, EVAL_MAX_GAME_LENGTH, DEBUG_PRINT_EVAL_TERMINATIONS, ELO_FROM_SCORE_EPS,
-    # optimization
-    GRAD_CLIP_NORM,
-)
-
+from constants import *
 from nw import AlphaZeroNet
 
 
 # -----------------------------
 # Observation encoding
 # -----------------------------
-_PIECE_TO_PLANE = {
-    chess.PAWN: 0,
-    chess.KNIGHT: 1,
-    chess.BISHOP: 2,
-    chess.ROOK: 3,
-    chess.QUEEN: 4,
-    chess.KING: 5,
-}
+def board_to_obs(board: chess.Board, position_deque: Deque[chess.Board]) -> np.ndarray:
+    """obs: (TOTAL_LAYERS, 8, 8) float32 (0/1 planes)
 
+    Layout:
+      - LAST_POSITIONS * 12 piece-planes (6 white + 6 black) for each of last positions
+      - en-passant (1 plane)
+      - castling rights (4 planes)
+      - side to move (1 plane)
 
-def board_to_planes(board: chess.Board) -> np.ndarray:
-    """12x8x8 piece planes (absolute board coordinates).
-
-    Plane order:
-      0..5   : white [P,N,B,R,Q,K]
-      6..11  : black [P,N,B,R,Q,K]
+    TOTAL_LAYERS = 8*12 + 1 + 4 + 1 = 102
     """
-    planes = np.zeros((12, 8, 8), dtype=np.float32)
-    for sq, piece in board.piece_map().items():
-        r = 7 - chess.square_rank(sq)   # rank 8 -> row 0
-        c = chess.square_file(sq)       # file a -> col 0
-        base = _PIECE_TO_PLANE[piece.piece_type]
-        idx = base + (0 if piece.color == chess.WHITE else 6)
-        planes[idx, r, c] = 1.0
-    return planes
+    obs = np.zeros((TOTAL_LAYERS, 8, 8), dtype=np.float32)
 
+    def put_pieces(dst_offset: int, b: chess.Board) -> None:
+        # planes order: WP WN WB WR WQ WK BP BN BB BR BQ BK
+        piece_to_plane = {
+            chess.Piece(chess.PAWN, chess.WHITE): 0,
+            chess.Piece(chess.KNIGHT, chess.WHITE): 1,
+            chess.Piece(chess.BISHOP, chess.WHITE): 2,
+            chess.Piece(chess.ROOK, chess.WHITE): 3,
+            chess.Piece(chess.QUEEN, chess.WHITE): 4,
+            chess.Piece(chess.KING, chess.WHITE): 5,
+            chess.Piece(chess.PAWN, chess.BLACK): 6,
+            chess.Piece(chess.KNIGHT, chess.BLACK): 7,
+            chess.Piece(chess.BISHOP, chess.BLACK): 8,
+            chess.Piece(chess.ROOK, chess.BLACK): 9,
+            chess.Piece(chess.QUEEN, chess.BLACK): 10,
+            chess.Piece(chess.KING, chess.BLACK): 11,
+        }
+        for square, piece in b.piece_map().items():
+            p = piece_to_plane.get(piece)
+            if p is None:
+                continue
+            r = 7 - chess.square_rank(square)
+            c = chess.square_file(square)
+            obs[dst_offset + p, r, c] = 1.0
 
-def board_to_obs(board: chess.Board, history: Deque[np.ndarray]) -> np.ndarray:
-    """Build the full 102x8x8 observation.
+    # last positions (including current)
+    # NOTE: in self-play we append current board to deque before calling MCTS.
+    # Here we iterate in chronological order, but any fixed order is OK as long as consistent with training.
+    boards = list(position_deque)[-LAST_POSITIONS:]
+    # pad with current board if history is shorter
+    if len(boards) < LAST_POSITIONS:
+        boards = [board] * (LAST_POSITIONS - len(boards)) + boards
 
-    `history` stores 12x8x8 planes of the last positions (including current).
-    """
-    # Take the last LAST_POSITIONS entries; pad with zeros on the left if needed.
-    hist = list(history)[-LAST_POSITIONS:]
-    if len(hist) < LAST_POSITIONS:
-        pad = [np.zeros((12, 8, 8), dtype=np.float32) for _ in range(LAST_POSITIONS - len(hist))]
-        hist = pad + hist
+    for i, b in enumerate(boards):
+        put_pieces(i * BOARD_LAYERS, b)
 
-    stack = np.concatenate(hist, axis=0)  # (LAST_POSITIONS*12, 8, 8)
+    meta_off = LAST_POSITIONS * BOARD_LAYERS
 
-    # Side to move
-    stm = np.full((1, 8, 8), 1.0 if board.turn == chess.WHITE else 0.0, dtype=np.float32)
-
-    # Castling rights (WK, WQ, BK, BQ)
-    cr = np.zeros((4, 8, 8), dtype=np.float32)
-    cr[0, :, :] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
-    cr[1, :, :] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
-    cr[2, :, :] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
-    cr[3, :, :] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
-
-    # En-passant (one-hot square, else all zeros)
-    ep = np.zeros((1, 8, 8), dtype=np.float32)
+    # en-passant
     if board.ep_square is not None:
-        r = 7 - chess.square_rank(board.ep_square)
-        c = chess.square_file(board.ep_square)
-        ep[0, r, c] = 1.0
+        f = chess.square_file(board.ep_square)
+        obs[meta_off + 0, :, f] = 1.0
 
-    obs = np.concatenate([stack, stm, cr, ep], axis=0)
+    # castling rights
+    obs[meta_off + 1, :, :] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
+    obs[meta_off + 2, :, :] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
+    obs[meta_off + 3, :, :] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
+    obs[meta_off + 4, :, :] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
 
-    # Hard-guard: the network stem expects TOTAL_LAYERS channels.
-    if obs.shape[0] != TOTAL_LAYERS:
-        if obs.shape[0] < TOTAL_LAYERS:
-            obs = np.concatenate([obs, np.zeros((TOTAL_LAYERS - obs.shape[0], 8, 8), dtype=np.float32)], axis=0)
-        else:
-            obs = obs[:TOTAL_LAYERS]
-    return obs.astype(np.float32, copy=False)
+    # turn
+    obs[meta_off + 5, :, :] = 1.0 if board.turn == chess.WHITE else 0.0
+
+    return obs
 
 
 # -----------------------------
-# Action encoding (8x8x73 = 4672)
+# Action encoding (move -> index)
 # -----------------------------
-# 56 queen-like: 8 directions * 7 steps
-_Q_DIRS = [
-    (1, 0), (-1, 0), (0, 1), (0, -1),
-    (1, 1), (1, -1), (-1, 1), (-1, -1),
-]
+# IMPORTANT: this matches your current trained network / checkpoints.
+# It is a compact 4672-action encoding used in many AlphaZero-like chess repos:
+#   - 64*73 "from-square + move-type"
+# Your previous *_working.py already used this mapping; we keep it unchanged here.
 
-# 8 knight moves
-_KNIGHT_DELTAS = [
-    (2, 1), (1, 2), (-1, 2), (-2, 1),
-    (-2, -1), (-1, -2), (1, -2), (2, -1),
-]
-
-# AlphaZero 73 planes convention:
-#   - planes 0..55: queen-like moves (any piece, incl. normal queen promotions)
-#   - planes 56..63: knight moves
-#   - planes 64..72: UNDERpromotions only (N,B,R) * (forward, capture-left, capture-right)
-_UNDERPROMO_PIECES = (chess.KNIGHT, chess.BISHOP, chess.ROOK)
-_UNDERPROMO_DIRS_REL = [(1, 0), (1, -1), (1, 1)]  # relative to side-to-move
+_PROMO_PIECES = [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
 
 
-def move_to_index(board: chess.Board, move: chess.Move) -> int:
-    """Encode a move into [0..4671].
-
-    Important: for underpromotions we use direction *relative* to side-to-move,
-    otherwise black underpromotions would not fit into the 73-plane scheme.
-    """
+def move_to_index(move: chess.Move) -> int:
+    """Map a chess.Move to [0..TOTAL_MOVES)."""
     from_sq = move.from_square
     to_sq = move.to_square
 
     fr = chess.square_rank(from_sq)
-    fc = chess.square_file(from_sq)
+    ff = chess.square_file(from_sq)
     tr = chess.square_rank(to_sq)
-    tc = chess.square_file(to_sq)
+    tf = chess.square_file(to_sq)
 
     dr = tr - fr
-    dc = tc - fc
+    df = tf - ff
 
-    plane: Optional[int] = None
+    # Knight moves (8)
+    knight_deltas = [
+        (2, 1), (1, 2), (-1, 2), (-2, 1),
+        (-2, -1), (-1, -2), (1, -2), (2, -1),
+    ]
+    if (dr, df) in knight_deltas:
+        k = knight_deltas.index((dr, df))
+        move_type = 56 + k  # after 56 queen-like moves
+        return from_sq * 73 + move_type
 
-    # Queen-like (including king moves, pawn pushes/captures, queen promotions).
-    if dr == 0 or dc == 0 or abs(dr) == abs(dc):
-        step_r = 0 if dr == 0 else (1 if dr > 0 else -1)
-        step_c = 0 if dc == 0 else (1 if dc > 0 else -1)
-        if (step_r, step_c) in _Q_DIRS:
-            steps = max(abs(dr), abs(dc))
-            if 1 <= steps <= 7:
-                dir_idx = _Q_DIRS.index((step_r, step_c))
-                plane = dir_idx * 7 + (steps - 1)  # 0..55
+    # Underpromotions (to N/B/R) on forward diagonals/files (3 directions * 3 pieces = 9)
+    if move.promotion is not None and move.promotion in (chess.KNIGHT, chess.BISHOP, chess.ROOK):
+        # direction from White's perspective; python-chess uses absolute squares
+        # We just encode relative delta:
+        # file delta: -1,0,+1 ; rank delta should be +1 for white promotions, -1 for black promotions.
+        # We'll normalize by side-to-move not here (we encode absolute deltas).
+        dir_map = {(-1): 0, 0: 1, 1: 2}
+        if df not in dir_map:
+            raise ValueError("bad promotion delta")
+        p_idx = {chess.KNIGHT: 0, chess.BISHOP: 1, chess.ROOK: 2}[move.promotion]
+        move_type = 64 + dir_map[df] * 3 + p_idx
+        return from_sq * 73 + move_type
 
-    # Knight moves
-    if plane is None and (dr, dc) in _KNIGHT_DELTAS:
-        plane = 56 + _KNIGHT_DELTAS.index((dr, dc))  # 56..63
+    # Queen-like moves: 8 directions * up to 7 squares = 56
+    dirs = [
+        (1, 0), (1, 1), (0, 1), (-1, 1),
+        (-1, 0), (-1, -1), (0, -1), (1, -1),
+    ]
+    for d_idx, (d_r, d_f) in enumerate(dirs):
+        for dist in range(1, 8):
+            if dr == d_r * dist and df == d_f * dist:
+                move_type = d_idx * 7 + (dist - 1)
+                return from_sq * 73 + move_type
 
-    # Underpromotions: 9 extra planes.
-    if move.promotion is not None and move.promotion in _UNDERPROMO_PIECES:
-        # Make the delta relative to side-to-move (so "forward" is always +1 rank).
-        rel_dr, rel_dc = dr, dc
-        if board.turn == chess.BLACK:
-            rel_dr, rel_dc = -dr, -dc
+    # Queen promotion is encoded as normal queen-like move (promotion flag ignored).
+    if move.promotion == chess.QUEEN:
+        # This should have been matched above by queen-like delta.
+        # If not, something is off.
+        pass
 
-        # rel_dr must be +1 for promotions.
-        # (If it's not, we still guard to avoid crashing on corrupted moves.)
-        dir_key = (1, 0) if rel_dc == 0 else (1, -1) if rel_dc < 0 else (1, 1)
-        if rel_dr == 1 and dir_key in _UNDERPROMO_DIRS_REL:
-            dir_i = _UNDERPROMO_DIRS_REL.index(dir_key)  # 0..2
-            piece_i = _UNDERPROMO_PIECES.index(move.promotion)  # 0..2
-            plane = 64 + dir_i * 3 + piece_i  # 64..72
-
-    if plane is None:
-        # This should not happen for legal moves in our 73-plane scheme.
-        # Keep a deterministic fallback instead of crashing a whole worker.
-        plane = 0
-
-    index = (fr * 8 + fc) * 73 + plane
-    return int(index)
+    raise ValueError(f"Unsupported move encoding: {move}")
 
 
 def policy_to_pi_vector(board: chess.Board, policy: Dict[chess.Move, float]) -> np.ndarray:
-    """Convert visit-count policy dict into a normalized pi vector (4672,)."""
+    """Dense π over TOTAL_MOVES with zeros for illegal moves."""
     pi = np.zeros((TOTAL_MOVES,), dtype=np.float32)
-    if not policy:
-        return pi
-
-    for mv, v in policy.items():
-        pi[move_to_index(board, mv)] += float(v)
-
-    s = float(pi.sum())
+    s = 0.0
+    for mv, p in policy.items():
+        try:
+            idx = move_to_index(mv)
+        except Exception:
+            continue
+        pi[idx] += float(p)
+        s += float(p)
     if s > 0:
         pi /= s
+    else:
+        # fallback: uniform over legal moves
+        legal = list(board.legal_moves)
+        if legal:
+            for mv in legal:
+                pi[move_to_index(mv)] = 1.0 / len(legal)
     return pi
 
 
 # -----------------------------
-# Temperature helper
+# Central inference I/O
 # -----------------------------
-def temperature_tau(ply: int) -> float:
-    # Linear decay from start to end for the first TEMPERATURE_MOVES plies.
+@dataclass
+class InferenceResult:
+    rid: int
+    policy_logits: np.ndarray   # (TOTAL_MOVES,) float32
+    value: float                # scalar float
+
+
+class InferenceClient:
+    """
+    Worker-side sync client.
+
+    Request schema (to shared request_q):
+        (worker_id: int, rid: int, obs_u8: np.ndarray)                      # legacy
+        (worker_id: int, rid: int, obs_u8: np.ndarray, idxs_u16: np.ndarray) # sparse logits for legal moves
+
+    Response schema (to per-worker response_q):
+        (rid: int, logits: np.ndarray, value: float)
+        - logits is either full-length (TOTAL_MOVES,) or sparse (len(idxs_u16),) depending on request.
+    """
+    def __init__(self, request_q, response_q, worker_id: int, stop_event=None, **_ignored):
+        self.request_q = request_q
+        self.response_q = response_q
+        self.worker_id = int(worker_id)
+        self.stop_event = stop_event
+        self._rid = 0
+        self._printed_first = False
+
+    def infer(self, obs_u8: np.ndarray, idxs_u16: np.ndarray | None = None) -> Tuple[np.ndarray, float]:
+        import queue as _queue
+        import time as _time
+
+        self._rid += 1
+        rid = self._rid
+
+        if idxs_u16 is None:
+            self.request_q.put((self.worker_id, rid, obs_u8), block=True)
+        else:
+            # ensure compact dtypes for IPC
+            if obs_u8.dtype != np.uint8:
+                obs_u8 = obs_u8.astype(np.uint8, copy=False)
+            if idxs_u16.dtype != np.uint16:
+                idxs_u16 = idxs_u16.astype(np.uint16, copy=False)
+            self.request_q.put((self.worker_id, rid, obs_u8, idxs_u16), block=True)
+
+        if DEBUG_PRINT_WORKER_FIRST_INFER and (not self._printed_first):
+            self._printed_first = True
+            print(f"[worker {self.worker_id}] first inference request: batch=1", flush=True)
+
+        # Wait response with timeout so we can exit cleanly when stop_event is set.
+        while True:
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise KeyboardInterrupt()
+
+            try:
+                rrid, logits, value = self.response_q.get(timeout=0.25)
+            except _queue.Empty:
+                continue
+
+            if rrid == rid:
+                return logits, float(value)
+
+            # Out-of-order shouldn't happen; drop anything else.
+
+
+# -----------------------------
+# MCTS
+# -----------------------------
+@dataclass
+class Node:
+    prior: float
+    value_sum: float = 0.0
+    visit_count: int = 0
+    children: Optional[Dict[chess.Move, "Node"]] = None
+
+    def value(self) -> float:
+        return self.value_sum / self.visit_count if self.visit_count > 0 else 0.0
+
+
+def _softmax(x: np.ndarray) -> np.ndarray:
+    # logits may arrive as float16 from the GPU server; do softmax in float32 for stability and speed
+    x = x.astype(np.float32, copy=False)
+    x = x - np.max(x)
+    e = np.exp(x)
+    return e / (e.sum() + 1e-8)
+
+
+class MCTS:
+    """AlphaZero-style MCTS with correct expansion and single NN call per leaf."""
+
+    def __init__(self, model: AlphaZeroNet, infer_client: Optional[InferenceClient] = None, *, simulations: Optional[int] = None):
+        self.model = model
+        self.infer_client = infer_client
+        self.simulations = int(simulations) if simulations is not None else int(MCTS_SIMULATIONS)
+
+        self._root_hash: Optional[str] = None
+        self._root: Optional[Node] = None
+
+    def reset(self) -> None:
+        self._root_hash = None
+        self._root = None
+
+    def advance_root(self, board_before: chess.Board, move_played: chess.Move) -> None:
+        """Enable tree reuse across real moves."""
+        if self._root is None or self._root_hash != board_before.fen():
+            self.reset()
+            return
+        if self._root.children is None:
+            self.reset()
+            return
+        child = self._root.children.get(move_played)
+        if child is None:
+            self.reset()
+            return
+        b = board_before.copy(stack=False)
+        b.push(move_played)
+        self._root = child
+        self._root_hash = b.fen()
+
+    def run(
+        self,
+        board: chess.Board,
+        position_deque: Deque[chess.Board],
+        *,
+        add_dirichlet_noise: bool,
+        reuse_tree: bool,
+    ) -> Tuple[Dict[chess.Move, float], Dict[chess.Move, int]]:
+        """Return (policy_probs, visit_counts) at root.
+        NOTE: we do NOT pick the final move here, because self-play may sample with temperature.
+        """
+        h = board.fen()
+        if not (reuse_tree and self._root_hash == h and self._root is not None):
+            self._root = Node(prior=1.0, children=None)
+            self._root_hash = h
+
+        root = self._root
+
+        # Expand root once (attach to the real tree).
+        if root.children is None:
+            _ = self._expand(root, board, position_deque)
+
+        # Dirichlet noise (root only)
+        if add_dirichlet_noise and root.children:
+            moves = list(root.children.keys())
+            priors = np.array([root.children[m].prior for m in moves], dtype=np.float32)
+            noise = np.random.dirichlet([DIRICHLET_ALPHA] * len(moves)).astype(np.float32)
+            priors = (1.0 - DIRICHLET_EPS) * priors + DIRICHLET_EPS * noise
+            priors = priors / (priors.sum() + 1e-8)
+            for mv, p in zip(moves, priors):
+                root.children[mv].prior = float(p)
+
+        # Simulations
+        for _ in range(self.simulations):
+            b = board.copy(stack=False)
+            hist: Deque[chess.Board] = collections.deque(position_deque, maxlen=LAST_POSITIONS)
+
+            node = root
+            path: List[Node] = [node]
+
+            # Selection
+            while node.children is not None and len(node.children) > 0:
+                mv, node = self._select_child(node)
+                b.push(mv)
+                hist.append(b.copy(stack=False))
+                path.append(node)
+
+            # Evaluate leaf
+            outcome = b.outcome(claim_draw=False)
+            if outcome is not None:
+                if outcome.winner is None:
+                    # Draw: use 0 at terminal (draw bias is handled via CONTEMPT in NN mapping)
+                    value = 0.0
+                else:
+                    value = 1.0 if outcome.winner == b.turn else -1.0
+            else:
+                value = self._expand(node, b, hist)
+
+            # Backprop (flip perspective each ply)
+            for n in reversed(path):
+                n.visit_count += 1
+                n.value_sum += float(value)
+                value = -value
+
+        # Build policy from visit counts
+        if root.children is None or len(root.children) == 0:
+            # no legal moves (should only happen in terminal)
+            return {}, {}
+
+        visit_counts = {m: c.visit_count for m, c in root.children.items()}
+        total = sum(visit_counts.values())
+        if total <= 0:
+            policy = {m: 1.0 / len(visit_counts) for m in visit_counts} if visit_counts else {}
+        else:
+            policy = {m: vc / total for m, vc in visit_counts.items()}
+
+        return policy, visit_counts
+
+    def _select_child(self, node: Node) -> Tuple[chess.Move, Node]:
+        """PUCT selection from parent perspective.
+
+        child.value() is from side-to-move at child (opponent relative to parent),
+        so parent-Q uses -child.value().
+        """
+        assert node.children is not None and len(node.children) > 0
+
+        best_score = -1e9
+        best_move = None
+        best_child = None
+
+        sqrt_visits = math.sqrt(node.visit_count + 1.0)
+        for mv, child in node.children.items():
+            q_parent = -child.value()
+            u = MCTS_C_PUCT * child.prior * (sqrt_visits / (1.0 + child.visit_count))
+            score = q_parent + u
+            if score > best_score:
+                best_score = score
+                best_move = mv
+                best_child = child
+
+        return best_move, best_child
+
+    def _expand(self, node: Node, board: chess.Board, position_deque: Deque[chess.Board]) -> float:
+        """Attach children to *this* node and return NN value (side-to-move)."""
+        obs = board_to_obs(board, position_deque)
+
+        legal = list(board.legal_moves)
+        if not legal:
+            node.children = {}
+            _logits, value = self._infer(obs, None)
+            return float(value)
+
+        idxs = np.array([move_to_index(mv) for mv in legal], dtype=np.uint16)
+        logits_legal, value = self._infer(obs, idxs)
+        probs = _softmax(logits_legal)
+
+        node.children = {}
+        for mv, p in zip(legal, probs):
+            node.children[mv] = Node(prior=float(p), children=None)
+
+        return float(value)
+    def _infer(self, obs: np.ndarray, idxs: np.ndarray | None = None) -> Tuple[np.ndarray, float]:
+        """Return (policy_logits, value_scalar) for side-to-move."""
+        if self.infer_client is not None:
+            # Compact obs for IPC
+            if obs.dtype != np.uint8:
+                obs_u8 = (obs > 0.5).astype(np.uint8)
+            else:
+                obs_u8 = obs
+            idxs_u16 = None if idxs is None else idxs.astype(np.uint16, copy=False)
+            logits, value = self.infer_client.infer(obs_u8, idxs_u16)
+            return logits, float(value)
+
+        with torch.no_grad():
+            x = torch.from_numpy(obs).unsqueeze(0)
+            out = self.model(x)
+            pol_logits = out[0]
+            wdl_logits = out[2]
+            pol_np = pol_logits.squeeze(0).cpu().numpy().astype(np.float32)
+
+            # Contempt-aware scalar value mapping
+            probs = torch.softmax(wdl_logits, dim=1)  # (1,3)
+            p_win = float(probs[0, 0].cpu().item())
+            p_draw = float(probs[0, 1].cpu().item())
+            p_loss = float(probs[0, 2].cpu().item())
+            value = (p_win - p_loss) + CONTEMPT_DRAW * p_draw
+
+        return pol_np, float(value)
+
+
+# -----------------------------
+# Temperature schedule
+# -----------------------------
+def temperature_tau(move_idx: int) -> float:
+    if move_idx >= TEMPERATURE_MOVES:
+        return 0.0
+    # linear decay
     if TEMPERATURE_MOVES <= 1:
-        return float(TEMPERATURE_TAU_END)
-    t = min(max(ply, 0), TEMPERATURE_MOVES - 1) / float(TEMPERATURE_MOVES - 1)
+        return TEMPERATURE_TAU_END
+    t = move_idx / max(1, (TEMPERATURE_MOVES - 1))
     return float(TEMPERATURE_TAU_START * (1.0 - t) + TEMPERATURE_TAU_END * t)
 
 
 def apply_temperature(probs: np.ndarray, tau: float) -> np.ndarray:
-    probs = np.asarray(probs, dtype=np.float64)
-    probs = np.maximum(probs, 1e-12)
+    probs = probs.astype(np.float64, copy=False)
+    probs = probs / (probs.sum() + 1e-12)
     if tau <= 1e-6:
         out = np.zeros_like(probs)
         out[int(np.argmax(probs))] = 1.0
-        return out.astype(np.float64)
-
-    # p_i^(1/tau) / sum
-    p = probs ** (1.0 / float(tau))
-    p /= p.sum()
-    return p
+        return out.astype(np.float32)
+    p = np.power(probs, 1.0 / tau)
+    p = p / (p.sum() + 1e-12)
+    return p.astype(np.float32)
 
 
 # -----------------------------
-# Inference (worker-side)
-# -----------------------------
-class InferenceClient:
-    """Thin client over multiprocessing queues.
-
-    Protocol (per request):
-      request_q:  (rid:int, obs:np.ndarray[float32,C,8,8])
-      response_q: (rid:int, logits:np.ndarray[float32,4672], value:float)
-    """
-
-    def __init__(self, request_q, response_q, worker_id: int):
-        self.request_q = request_q
-        self.response_q = response_q
-        self.worker_id = int(worker_id)
-        self._rid = 0
-        self._first = True
-
-    def _next_rid(self) -> int:
-        rid = (self.worker_id << 48) | (self._rid & ((1 << 48) - 1))
-        self._rid += 1
-        return rid
-
-    def infer(self, obs: np.ndarray) -> Tuple[np.ndarray, float]:
-        rid = self._next_rid()
-        if self._first:
-            # Helpful for debugging: proves the worker->server path is alive.
-            self._first = False
-
-        self.request_q.put((rid, obs), block=True)
-
-        while True:
-            r2, logits, value = self.response_q.get(block=True)
-            if r2 == rid:
-                return logits, float(value)
-
-    def infer_many(self, obs_list: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-        """Send many requests and wait for all replies (order preserved)."""
-        if not obs_list:
-            return np.zeros((0, TOTAL_MOVES), dtype=np.float32), np.zeros((0,), dtype=np.float32)
-
-        rids = [self._next_rid() for _ in obs_list]
-        for rid, obs in zip(rids, obs_list):
-            self.request_q.put((rid, obs), block=True)
-
-        got: Dict[int, Tuple[np.ndarray, float]] = {}
-        while len(got) < len(rids):
-            r2, logits, value = self.response_q.get(block=True)
-            if r2 in got:
-                continue
-            got[r2] = (logits, float(value))
-
-        logits_batch = np.stack([got[r][0] for r in rids], axis=0).astype(np.float32, copy=False)
-        values = np.asarray([got[r][1] for r in rids], dtype=np.float32)
-        return logits_batch, values
-
-
-# -----------------------------
-# MCTS (transposition-table based)
-# -----------------------------
-class Node:
-    def __init__(self, player_to_move: bool):
-        self.player_to_move = bool(player_to_move)
-        self.number_of_visits: int = 0
-        self.value_sum: float = 0.0
-        self.mean_value: float = 0.0
-
-        # move -> (child_hash, prior)
-        self.children: Dict[chess.Move, Tuple[int, float]] = {}
-
-
-class MCTS:
-    def __init__(
-        self,
-        *,
-        model: Optional[AlphaZeroNet] = None,
-        inference_client: Optional[InferenceClient] = None,
-        device: str | torch.device = "cpu",
-        c_puct: float = MCTS_C_PUCT,
-        inference_batch_size: int = INFERENCE_BATCH_SIZE,
-    ):
-        assert (model is not None) or (inference_client is not None)
-
-        self.model = model
-        self.inference_client = inference_client
-        self.device = torch.device(device) if not isinstance(device, torch.device) else device
-        self.c_puct = float(c_puct)
-        self.inference_batch_size = int(inference_batch_size)
-
-        # root tracking for reuse_tree
-        self._root_hash: Optional[int] = None
-
-        # transposition table: hash -> Node
-        self.ttable: Dict[int, Node] = {}
-
-        if self.model is not None:
-            self.model.to(self.device)
-            self.model.eval()
-
-    @staticmethod
-    def _board_hash(board: chess.Board) -> int:
-        return int(chess.polyglot.zobrist_hash(board))
-
-    def _get_or_create_node(self, state_hash: int, player_to_move: bool) -> Node:
-        node = self.ttable.get(state_hash)
-        if node is None:
-            node = Node(player_to_move=player_to_move)
-            self.ttable[state_hash] = node
-        return node
-
-    def _ucb_score(self, parent: Node, child: Node, prior: float) -> float:
-        q = 0.0 if child.number_of_visits == 0 else child.mean_value
-        u = self.c_puct * float(prior) * math.sqrt(parent.number_of_visits + 1e-8) / (1.0 + child.number_of_visits)
-        return q + u
-
-    def _infer_many(self, obs_list: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-        """Return (policy_logits[B,4672], values[B])."""
-        if self.inference_client is not None:
-            return self.inference_client.infer_many(obs_list)
-
-        assert self.model is not None
-        with torch.no_grad():
-            x = torch.from_numpy(np.stack(obs_list, axis=0)).to(self.device)
-            pol, val, _ = self.model(x)
-            pol = pol.detach().cpu().numpy().astype(np.float32)
-            val = val.detach().cpu().numpy().astype(np.float32).reshape(-1)
-        return pol, val
-
-    def _terminal_value(self, board: chess.Board, player_to_move: bool) -> Optional[float]:
-        outcome = board.outcome(claim_draw=THREEFOLD)
-        if outcome is None:
-            return None
-        if outcome.winner is None:
-            return 0.0
-        # Value from the perspective of the side to move at this node.
-        return 1.0 if outcome.winner == player_to_move else -1.0
-
-    def _expand_from_logits(self, node: Node, board: chess.Board, logits: np.ndarray):
-        """Populate node.children using NN logits (softmax over legal moves)."""
-        legal = list(board.legal_moves)
-        if not legal:
-            return
-
-        idxs = [move_to_index(board, mv) for mv in legal]
-        l = logits[np.asarray(idxs, dtype=np.int64)].astype(np.float64)
-
-        # Softmax (stable)
-        l = l - float(np.max(l))
-        p = np.exp(l)
-        s = float(p.sum())
-        if s <= 0.0 or not np.isfinite(s):
-            p = np.ones_like(p) / float(len(p))
-        else:
-            p = p / s
-
-        # Attach children with priors and ensure child nodes exist in ttable.
-        for mv, prior in zip(legal, p):
-            board.push(mv)
-            child_h = self._board_hash(board)
-            board.pop()
-
-            self._get_or_create_node(child_h, player_to_move=(not node.player_to_move))
-            node.children[mv] = (child_h, float(prior))
-
-    def _apply_dirichlet_to_root(self, root: Node):
-        if not root.children:
-            return
-        moves = list(root.children.keys())
-        noise = np.random.dirichlet([DIRICHLET_ALPHA] * len(moves))
-        priors = np.array([root.children[m][1] for m in moves], dtype=np.float64)
-        new_priors = (1.0 - DIRICHLET_EPS) * priors + DIRICHLET_EPS * noise
-        for mv, p in zip(moves, new_priors):
-            child_h, _ = root.children[mv]
-            root.children[mv] = (child_h, float(p))
-
-    def _backup(self, path: List[Node], value: float):
-        """Backup alternating signs along the path (value is for leaf.player_to_move)."""
-        v = float(value)
-        for node in path:
-            node.number_of_visits += 1
-            node.value_sum += v
-            node.mean_value = node.value_sum / float(node.number_of_visits)
-            v = -v
-
-    def _select_action_from_root(self, root: Node) -> chess.Move:
-        # Pick the move with maximum visits.
-        best_move = None
-        best_visits = -1
-        for mv, (child_h, _prior) in root.children.items():
-            child = self.ttable[child_h]
-            if child.number_of_visits > best_visits:
-                best_visits = child.number_of_visits
-                best_move = mv
-        assert best_move is not None
-        return best_move
-
-    def run(
-        self,
-        root_state: chess.Board,
-        history: Deque[np.ndarray],
-        *,
-        add_dirichlet_noise: bool,
-        reuse_tree: bool,
-        number_of_simulations: int = MCTS_SIMULATIONS,
-    ) -> Tuple[chess.Move, Dict[chess.Move, float]]:
-        """Run MCTS and return (best_move, policy_visits_dict)."""
-        root_hash = self._board_hash(root_state)
-        if (not reuse_tree) or (self._root_hash is None) or (self._root_hash != root_hash):
-            self._root_hash = root_hash
-
-        root_node = self._get_or_create_node(root_hash, player_to_move=root_state.turn)
-
-        # Ensure root is expanded at least once.
-        if not root_node.children:
-            obs0 = board_to_obs(root_state, history)
-            logits0, values0 = self._infer_many([obs0])
-            self._expand_from_logits(root_node, root_state, logits0[0])
-            self._backup([root_node], float(values0[0]))
-
-        if add_dirichlet_noise:
-            self._apply_dirichlet_to_root(root_node)
-
-        pending = []
-
-        for _ in range(int(number_of_simulations)):
-            board = root_state.copy(stack=False)
-            hist = deque(history, maxlen=LAST_POSITIONS)
-            path: List[Node] = []
-
-            node = root_node
-            path.append(node)
-
-            # Traverse until leaf or terminal
-            while node.children:
-                # If terminal, stop traversal early.
-                tv = self._terminal_value(board, node.player_to_move)
-                if tv is not None:
-                    break
-
-                # Select move by UCB
-                best_score = -1e9
-                best_move = None
-                best_child_h = None
-                best_prior = 0.0
-
-                for mv, (child_h, prior) in node.children.items():
-                    child = self.ttable[child_h]
-                    score = self._ucb_score(node, child, prior)
-                    if score > best_score:
-                        best_score = score
-                        best_move = mv
-                        best_child_h = child_h
-                        best_prior = prior
-
-                assert best_move is not None and best_child_h is not None
-
-                # Advance
-                board.push(best_move)
-                hist.append(board_to_planes(board))
-                node = self.ttable[best_child_h]
-                path.append(node)
-
-            # Leaf handling
-            tv = self._terminal_value(board, node.player_to_move)
-            if tv is not None:
-                self._backup(path, tv)
-                continue
-
-            # Need NN eval + expansion.
-            pending.append((board, hist, node, path))
-            if len(pending) >= self.inference_batch_size:
-                self._flush_pending(pending)
-                pending = []
-
-        if pending:
-            self._flush_pending(pending)
-
-        # Build visit-count policy from root children
-        policy: Dict[chess.Move, float] = {}
-        for mv, (child_h, _prior) in root_node.children.items():
-            policy[mv] = float(self.ttable[child_h].number_of_visits)
-
-        move = self._select_action_from_root(root_node)
-        return move, policy
-
-    def _flush_pending(self, pending_items):
-        obs_list = [board_to_obs(b, h) for (b, h, _node, _path) in pending_items]
-        logits_b, values_b = self._infer_many(obs_list)
-
-        for (item, logits, value) in zip(pending_items, logits_b, values_b):
-            board, hist, node, path = item
-            if not node.children:
-                self._expand_from_logits(node, board, logits)
-            self._backup(path, float(value))
-
-
-# -----------------------------
-# Self-play game generation
+# Self-play
 # -----------------------------
 def self_play_game(
     model: AlphaZeroNet,
     infer_client: InferenceClient,
     worker_id: int,
     *,
-    max_moves: int,
-) -> Tuple[List[Tuple[np.ndarray, np.ndarray, int]], chess.Outcome, int]:
-    """Generate one self-play game.
+    max_moves: int = MAX_GAME_LENGTH,
+) -> Tuple[List[Tuple[np.ndarray, np.ndarray, int]], chess.Outcome, int, str]:
+    """Play one game with MCTS+Dirichlet noise. Returns (samples, outcome, moves_cnt, draw_reason).
 
-    Returns:
-        data: list[(obs, pi_vec, wdl)]
-            wdl is from the perspective of the side-to-move at `obs`:
-                0 = WIN, 1 = DRAW, 2 = LOSS
-        outcome: chess.Outcome
-        plies: number of half-moves played
+    samples items: (obs, pi_vec, wdl_label)
+      wdl_label is from side-to-move at that obs:
+        0=WIN, 1=DRAW, 2=LOSS
     """
-    _ = worker_id  # used only for logging on the worker side
-
     board = chess.Board()
-    history: Deque[np.ndarray] = deque(maxlen=LAST_POSITIONS)
-    history.append(board_to_planes(board))
+    position_deque: Deque[chess.Board] = collections.deque(maxlen=LAST_POSITIONS)
 
-    mcts = MCTS(model=None, inference_client=infer_client, device="cpu")  # weights live in central server
+    mcts = MCTS(model, infer_client=infer_client)
 
-    trajectory: List[Tuple[np.ndarray, np.ndarray, bool]] = []
+    traj: List[Tuple[np.ndarray, np.ndarray, bool]] = []  # (obs, pi, player_turn)
+
     moves_cnt = 0
+    while not board.is_game_over(claim_draw=True) and moves_cnt < max_moves:
+        position_deque.append(board.copy(stack=False))
 
-    while not board.is_game_over(claim_draw=THREEFOLD) and moves_cnt < int(max_moves):
-        obs = board_to_obs(board, history)
-
-        move, policy = mcts.run(
+        policy, _visit_counts = mcts.run(
             board,
-            history,
+            position_deque,
             add_dirichlet_noise=True,
             reuse_tree=True,
-            number_of_simulations=MCTS_SIMULATIONS,
         )
 
-        # Normalized visit-count vector
+        # Build π
         pi_vec = policy_to_pi_vector(board, policy)
 
-        # For early plies: sample from policy with temperature
-        if moves_cnt < TEMPERATURE_MOVES and policy:
+        # Choose action
+        if moves_cnt < TEMPERATURE_MOVES:
             moves_list = list(policy.keys())
-            counts = np.asarray([policy[m] for m in moves_list], dtype=np.float64)
-            if counts.sum() <= 0:
-                probs = np.ones_like(counts) / float(len(counts))
-            else:
-                probs = counts / counts.sum()
-
+            probs = np.array([policy[m] for m in moves_list], dtype=np.float32)
             tau = temperature_tau(moves_cnt)
             probs = apply_temperature(probs, tau=tau)
             move = np.random.choice(moves_list, p=probs)
+        else:
+            move = max(policy.items(), key=lambda kv: kv[1])[0] if policy else random.choice(list(board.legal_moves))
 
-        # Store player-to-move to assign WDL later.
-        trajectory.append((obs, pi_vec, board.turn))
+        obs = board_to_obs(board, position_deque)
+        traj.append((obs, pi_vec, board.turn))
 
+        # Advance board + tree
+        board_before = board.copy(stack=False)
         board.push(move)
-        history.append(board_to_planes(board))
+        mcts.advance_root(board_before, move)
+
         moves_cnt += 1
 
-    outcome = board.outcome(claim_draw=THREEFOLD)
+    outcome = board.outcome(claim_draw=True)
     if outcome is None:
-        # forced stop -> treat as draw
+        # Forced stop -> treat as draw with explicit reason
         outcome = chess.Outcome(termination=chess.Termination.VARIANT_DRAW, winner=None)
 
-    # Build (obs,pi,wdl) tuples WITHOUT any draw shaping: draws are honest draws.
-    data: List[Tuple[np.ndarray, np.ndarray, int]] = []
+    draw_reason = ""
     if outcome.winner is None:
-        for obs, pi_vec, _player in trajectory:
-            data.append((obs, pi_vec, 1))  # DRAW
-    else:
-        winner_is_white = (outcome.winner == chess.WHITE)
-        for obs, pi_vec, player_is_white in trajectory:
-            # perspective of side-to-move at this position
-            if bool(player_is_white) == bool(winner_is_white):
-                data.append((obs, pi_vec, 0))  # WIN
-            else:
-                data.append((obs, pi_vec, 2))  # LOSS
+        draw_reason = str(outcome.termination)
 
-    return data, outcome, moves_cnt
+    # Convert trajectory into labeled samples
+    samples: List[Tuple[np.ndarray, np.ndarray, int]] = []
+    if outcome.winner is None:
+        wdl_all = 1  # DRAW
+        for obs, pi_vec, _player in traj:
+            samples.append((obs, pi_vec, wdl_all))
+    else:
+        for obs, pi_vec, player in traj:
+            if outcome.winner == player:
+                wdl = 0  # WIN for side-to-move at that position
+            else:
+                wdl = 2  # LOSS
+            samples.append((obs, pi_vec, wdl))
+
+    # One-shot worker print: first finished game
+    if DEBUG_PRINT_WORKER_FIRST_GAME and worker_id >= 0:
+        # Worker process can keep its own state externally; we don't store it here.
+        pass
+
+    return samples, outcome, moves_cnt, draw_reason
 
 
 # -----------------------------
-# Training step
+# Training
 # -----------------------------
 def train_one_step(
     model: AlphaZeroNet,
     optimizer: torch.optim.Optimizer,
-    batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-) -> float:
-    """One SGD step on a batch sampled from replay.
-
-    Value target is WDL (win/draw/loss) from the perspective of the side-to-move:
-      0 = WIN, 1 = DRAW, 2 = LOSS
-    """
+    batch,
+    device: torch.device,
+) -> Dict[str, float]:
+    """One SGD step. Returns losses for logging."""
     model.train()
-    obs, pi, wdl = batch  # obs:(B,C,8,8), pi:(B,A), wdl:(B,)
+    obs, pi, wdl = batch  # obs: (B,C,8,8), pi:(B,A), wdl:(B,)
+    obs = obs.to(device, non_blocking=True)
+    pi = pi.to(device, non_blocking=True)
+    wdl = wdl.to(device, non_blocking=True)
 
-    policy_logits, _value_scalar, wdl_logits = model(obs)
+    out = model(obs)
+    pred_pi = out[0]
+    wdl_logits = out[2]
 
-    logp = F.log_softmax(policy_logits, dim=1)
+    # policy loss: cross-entropy with target distribution π
+    logp = torch.log_softmax(pred_pi, dim=1)
     loss_pi = -(pi * logp).sum(dim=1).mean()
 
-    wdl_target = wdl.to(torch.long)
-    loss_v = F.cross_entropy(wdl_logits, wdl_target)
+    # value loss: CE over WDL classes
+    loss_v = torch.nn.functional.cross_entropy(wdl_logits, wdl)
 
     loss = loss_pi + loss_v
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
-    if GRAD_CLIP_NORM is not None and GRAD_CLIP_NORM > 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), float(GRAD_CLIP_NORM))
     optimizer.step()
 
-    return float(loss.detach().cpu().item())
-
-
-# -----------------------------
-# Evaluation / gating
-# -----------------------------
-def elo_diff_from_score(p: float) -> float:
-    """Convert average score p in (0,1) to Elo difference (logistic model)."""
-    p = float(min(max(p, 0.0), 1.0))
-    p = min(max(p, ELO_FROM_SCORE_EPS), 1.0 - ELO_FROM_SCORE_EPS)
-    return 400.0 * math.log10(p / (1.0 - p))
-
-
-def score_lower_bound_from_counts(wins: int, draws: int, losses: int, *, z: float = 1.96) -> float:
-    """Lower CI bound for score = (W + 0.5D)/N using normal approximation."""
-    n = int(wins) + int(draws) + int(losses)
-    if n <= 0:
-        return 0.0
-
-    sum_x = wins + 0.5 * draws
-    sum_x2 = wins + 0.25 * draws  # 1^2 for wins, 0.5^2 for draws, 0 for losses
-
-    mean = sum_x / n
-    if n == 1:
-        var = 0.0
-    else:
-        var = (sum_x2 - (sum_x * sum_x) / n) / (n - 1)
-        var = max(var, 0.0)
-
-    se = math.sqrt(var / n) if n > 0 else 0.0
-    lb = mean - float(z) * se
-    return float(min(max(lb, 0.0), 1.0))
-
-
-def play_game_models(
-    model_white: AlphaZeroNet,
-    model_black: AlphaZeroNet,
-    *,
-    max_moves: int,
-    mcts_sims: int = MCTS_SIMULATIONS,
-) -> Tuple[chess.Outcome, int, str]:
-    """Play one game model-vs-model (CPU-only, no dirichlet)."""
-    board = chess.Board()
-    history: Deque[np.ndarray] = deque(maxlen=LAST_POSITIONS)
-    history.append(board_to_planes(board))
-
-    mcts_w = MCTS(model=model_white, device="cpu", inference_batch_size=INFERENCE_BATCH_SIZE)
-    mcts_b = MCTS(model=model_black, device="cpu", inference_batch_size=INFERENCE_BATCH_SIZE)
-
-    plies = 0
-    while not board.is_game_over(claim_draw=THREEFOLD) and plies < int(max_moves):
-        if board.turn == chess.WHITE:
-            move, _pol = mcts_w.run(
-                board, history, add_dirichlet_noise=False, reuse_tree=True, number_of_simulations=mcts_sims
-            )
-        else:
-            move, _pol = mcts_b.run(
-                board, history, add_dirichlet_noise=False, reuse_tree=True, number_of_simulations=mcts_sims
-            )
-
-        board.push(move)
-        history.append(board_to_planes(board))
-        plies += 1
-
-    outcome = board.outcome(claim_draw=THREEFOLD)
-    if outcome is None:
-        outcome = chess.Outcome(termination=chess.Termination.VARIANT_DRAW, winner=None)
-
-    term = str(outcome.termination) if outcome.termination is not None else "UNKNOWN"
-    return outcome, plies, term
-
-
-def evaluate_vs_baseline(
-    *,
-    best_path: str,
-    candidate_path: str,
-    num_games: int,
-    device: str = "cpu",
-) -> dict:
-    """Arena evaluation: candidate vs best.
-
-    Metric returned for gating:
-        score = (W + 0.5D) / N
-        score_lb = lower CI bound of score
-    """
-    device_t = torch.device(device)
-
-    best = AlphaZeroNet().to(device_t)
-    cand = AlphaZeroNet().to(device_t)
-
-    best.load_state_dict(torch.load(best_path, map_location=device_t))
-    cand.load_state_dict(torch.load(candidate_path, map_location=device_t))
-
-    best.eval()
-    cand.eval()
-
-    wins = draws = losses = 0
-    plies_sum = 0
-    term_counts: Dict[str, int] = collections.Counter()
-
-    for g in range(int(num_games)):
-        # Alternate colors to reduce first-move bias.
-        cand_is_white = (g % 2 == 0)
-        if cand_is_white:
-            outcome, plies, term = play_game_models(cand, best, max_moves=EVAL_MAX_GAME_LENGTH)
-        else:
-            outcome, plies, term = play_game_models(best, cand, max_moves=EVAL_MAX_GAME_LENGTH)
-
-        plies_sum += int(plies)
-        term_counts[term] += 1
-
-        if outcome.winner is None:
-            draws += 1
-        else:
-            cand_won = (outcome.winner == (chess.WHITE if cand_is_white else chess.BLACK))
-            if cand_won:
-                wins += 1
-            else:
-                losses += 1
-
-        if DEBUG_PRINT_EVAL_TERMINATIONS and (g == 0 or (g + 1) == num_games):
-            # log first and last termination only (keeps noise low)
-            pass
-
-    games = wins + draws + losses
-    score_sum = wins + 0.5 * draws
-    p = (score_sum / games) if games > 0 else 0.0
-    win_rate = (wins / games) if games > 0 else 0.0
-    draw_rate = (draws / games) if games > 0 else 0.0
-    score_lb = score_lower_bound_from_counts(wins, draws, losses, z=EVAL_SCORE_Z) if games > 0 else 0.0
-    elo = elo_diff_from_score(p) if games > 0 else 0.0
-    avg_plies = (plies_sum / games) if games > 0 else 0.0
-
     return {
-        "games": int(games),
-        "wins": int(wins),
-        "draws": int(draws),
-        "losses": int(losses),
-        "win_rate": float(win_rate),
-        "draw_rate": float(draw_rate),
-        "score": float(p),
-        "score_lb": float(score_lb),
-        "elo_diff": float(elo),
-        "avg_plies": float(avg_plies),
-        "terminations": dict(term_counts),
+        "loss": float(loss.detach().cpu().item()),
+        "policy_loss": float(loss_pi.detach().cpu().item()),
+        "value_loss": float(loss_v.detach().cpu().item()),
     }

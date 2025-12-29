@@ -1,150 +1,156 @@
 # constants.py
 # -*- coding: utf-8 -*-
-"""Project-wide constants.
 
-Key invariants (please keep these consistent with checkpoints / replay buffer):
+"""
+Central config for the chess self-play + training loop.
 
-Observation tensor shape
-------------------------
-We use `TOTAL_LAYERS = 102` planes of size 8x8:
-
-History (LAST_POSITIONS * 12):
-  - 12 piece planes per position: [P,N,B,R,Q,K] x [white, black]
-  - We stack the last `LAST_POSITIONS` positions (including the current one).
-    => 8 * 12 = 96 planes
-
-Meta (6):
-  - 1 plane: side-to-move (all 1.0 if white to move else 0.0)
-  - 4 planes: castling rights (WK, WQ, BK, BQ)
-  - 1 plane: en-passant square (one-hot on the ep square, else all zeros)
-
-TOTAL: 96 + 6 = 102.
-
-Move space
-----------
-AlphaZero-style fixed action space: 8x8x73 = 4672.
+Key design decisions (current "WD L" setup):
+- Network outputs:
+    * policy_logits: (B, TOTAL_MOVES)
+    * wdl_logits:    (B, 3)  classes [WIN, DRAW, LOSS] from side-to-move perspective
+    * value:         scalar derived from wdl (used in MCTS only)
+- Training uses:
+    * policy loss: cross-entropy with target visit-count distribution π
+    * value loss:  cross-entropy on WDL classes
+- "Contempt" is implemented in search-time value mapping:
+    v = P(win) - P(loss) + CONTEMPT_DRAW * P(draw)
+  This keeps WDL training intact, but biases MCTS away from drawish lines.
 """
 
 # -----------------------------
-# Paths
+# Performance toggles
 # -----------------------------
-CHECKPOINT_PATH = "checkpoints/alphazero_like.pth"     # current training weights (candidate)
-BEST_CHECKPOINT_PATH = "checkpoints/best.pth"          # frozen baseline for gating/eval
+# Use FP16 autocast for inference on CUDA (обычно быстрее на RTX 40xx)
+USE_FP16_INFERENCE = True
 
-REPLAY_PATH = "replay_buffer/replay_buffer.npz"
-DEFAULT_REPLAY_PATH = REPLAY_PATH  # compat: replay_buffer.py uses this name
+# Use channels_last memory format for CNN (может ускорять cuDNN conv)
+USE_CHANNELS_LAST = True
 
-EVAL_CANDIDATE_PATH = "tmp_eval/candidate_eval.pth"
-EVAL_TMP_DIR = "tmp_eval"
+
+import chess
 
 # -----------------------------
 # Observation encoding
 # -----------------------------
-BOARD_LAYERS = 12
-LAST_POSITIONS = 8
+BOARD_LAYERS = 12                  # piece planes: 6 for white + 6 for black
+EN_PASSANT_LAYERS = 1              # file of en-passant square (or all zeros)
+CASTLES_LAYERS = 4                 # WK, WQ, BK, BQ
+TURN_LAYERS = 1                    # side to move
 
-TURN_LAYERS = 1
-CASTLES_LAYERS = 4
-EN_PASSANT_LAYERS = 1
+LAST_POSITIONS = 8                 # how many previous positions are stacked
 
-TOTAL_LAYERS = LAST_POSITIONS * BOARD_LAYERS + TURN_LAYERS + CASTLES_LAYERS + EN_PASSANT_LAYERS  # 102
-
-# -----------------------------
-# Action space
-# -----------------------------
-TOTAL_MOVES = 4672  # 8*8*73
+META_LAYERS = EN_PASSANT_LAYERS + CASTLES_LAYERS + TURN_LAYERS
+TOTAL_LAYERS = META_LAYERS + LAST_POSITIONS * BOARD_LAYERS   # 6 + 8*12 = 102
 
 # -----------------------------
-# Self-play game length
+# Action encoding
+# -----------------------------
+TOTAL_MOVES = 4672
+
+# -----------------------------
+# Paths
+# -----------------------------
+CHECKPOINT_PATH = "checkpoints/alphazero_like.pth"     # candidate
+BEST_CHECKPOINT_PATH = "checkpoints/best.pth"          # baseline
+
+REPLAY_PATH = "replay_buffer/replay_buffer.npz"
+DEFAULT_REPLAY_PATH = REPLAY_PATH
+
+# -----------------------------
+# Self-play
 # -----------------------------
 MAX_GAME_LENGTH = 2048
 
-# -----------------------------
-# MCTS (Monte Carlo Tree Search)
-# -----------------------------
-MCTS_SIMULATIONS = 128
-WEB_MCTS_SIMULATIONS = 1600
-EVAL_MCTS_SIMULATIONS = 256
+# MCTS
+MCTS_SIMULATIONS = 200
 MCTS_C_PUCT = 1.5
 
-# Dirichlet noise (root exploration during training self-play)
-DIRICHLET_ALPHA = 0.30
+DIRICHLET_ALPHA = 0.3
 DIRICHLET_EPS = 0.25
 
-# MCTS batching (within one worker/game). The central inference server
-# will also batch across workers, but this helps avoid per-leaf round-trips.
-INFERENCE_BATCH_SIZE = 16
-
-# Temperature schedule (sampling from visit-count policy in early plies)
-TEMPERATURE_MOVES = 30
+TEMPERATURE_MOVES = 10
 TEMPERATURE_TAU_START = 1.25
 TEMPERATURE_TAU_END = 0.25
 
-# If True: claim draw by threefold repetition when checking termination.
-# If False: repetitions won't immediately terminate; games rely on MAX_GAME_LENGTH.
-THREEFOLD = True
-
-# -----------------------------
-# Optimization / training
-# -----------------------------
-# Train only after this many positions are present (avoids overfitting on tiny replay).
-MIN_REPLAY_SIZE = 4096
-
-# How many gradient steps to run per newly finished self-play game.
-TRAIN_STEPS_PER_GAME = 4
-
-BATCH_SIZE = 1024
-LEARNING_RATE = 2e-4
-WEIGHT_DECAY = 1e-4
-GRAD_CLIP_NORM = 1.0
+# Contempt (search-time only)
+CONTEMPT_DRAW = -0.05
 
 # -----------------------------
 # Replay buffer
 # -----------------------------
 REPLAY_CAPACITY = 300_000
-
-# Stratified replay: keep checkmates in a separate buffer.
-MATE_BUFFER_FRACTION = 0.5
 P_MATE_IN_BATCH = 0.5
 
 # -----------------------------
-# Multi-process self-play
+# Training
 # -----------------------------
-NUM_SELFPLAY_WORKERS = 16
+BATCH_SIZE = 1024
+TRAIN_STEPS_PER_GAME = 4
+LEARNING_RATE = 2e-4
+WEIGHT_DECAY = 1e-4
 
 # -----------------------------
 # Central inference server (main process)
 # -----------------------------
-SERVER_MAX_INFERENCE_POSITIONS = 128
-SERVER_BATCH_TIMEOUT_S = 0.005
+NUM_SELFPLAY_WORKERS = 64
 
-SERVER_TICK_EVERY_S = 5.0
-SERVER_DRAIN_GAMES_PER_TICK = 16
-
-# -----------------------------
-# Checkpoint saving
-# -----------------------------
-SAVE_MODEL_PER_GAMES = 100
-SAVE_BUFFER_PER_GAMES = 500
+SERVER_MAX_INFERENCE_POSITIONS = 256      # max batch size
+SERVER_BATCH_TIMEOUT_S = 0.010            # batching latency
+SERVER_TICK_EVERY_S = 5.0                 # console tick
+SERVER_DRAIN_GAMES_PER_TICK = 4           # how many finished games we consume per tick
+SERVER_IDLE_SLEEP_S = 0.001               # main loop sleep if nothing to do
 
 # -----------------------------
-# Evaluation (arena + gating)
+# Saving
 # -----------------------------
-EVAL_EVERY_GAMES = 500
+SAVE_MODEL_PER_GAMES = 50
+SAVE_BUFFER_PER_GAMES = 50
+
+# -----------------------------
+# Evaluation + gating
+# -----------------------------
+EVAL_EVERY_GAMES = 1
 EVAL_NUM_GAMES = 50
-
-# A secondary, human-readable metric.
-ELO_FROM_SCORE_EPS = 1e-6
-EVAL_PROMOTE_ELO = 70.0  # kept for logging / optional use
-
-# Primary metric: score = (W + 0.5*D) / N (draw counts as half-win).
-EVAL_PROMOTE_SCORE = 0.55   # promote if lower CI bound of score >= this
-EVAL_SCORE_Z = 1.96         # ~95% normal-approx for score CI lower bound
-
 EVAL_MAX_GAME_LENGTH = 768
 
+# Promote if lower bound of score CI >= threshold.
+# Score uses chess scoring: win=1, draw=0.5, loss=0.
+EVAL_PROMOTE_SCORE = 0.55
+EVAL_SCORE_Z = 1.96
+
+
+# Threads for Torch CPU inference during evaluation (best vs cand)
+EVAL_TORCH_THREADS = 8
+# Backwards-typo alias
+ELAV_TORCH_THREADS = EVAL_TORCH_THREADS
+# MCTS for eval (keep smaller than self-play by default)
+EVAL_MCTS_SIMULATIONS = 128
+WEB_MCTS_SIMULATIONS = 1600
+
 # -----------------------------
-# Debug
+# Debug flags (grouped)
 # -----------------------------
+DEBUG_PREFIX_TIME = True
+
+# 1) games stats
+DEBUG_GAMES = True
+
+# 2) infer_pos/5s, gpm
+DEBUG_INFER = True
+
+# 3) evaluation + gating
+DEBUG_EVALUATION = True
+
+# 4) replay_buffer sizes
+DEBUG_REPLAY = True
+
+# 5) losses (policy/value/total)
+DEBUG_LOSSES = True
+
+# 6) draw reason stats
+DEBUG_DRAW_REASON = True
+
+# Extra one-shot worker prints
 DEBUG_PRINT_WORKER_FIRST_INFER = True
+DEBUG_PRINT_WORKER_FIRST_GAME = True
 DEBUG_PRINT_EVAL_TERMINATIONS = True

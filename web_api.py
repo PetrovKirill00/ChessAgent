@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
-import inspect
+import random
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import uuid4
 
+import numpy as np
 import chess
 import torch
 from fastapi import FastAPI, HTTPException
@@ -14,8 +16,14 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from constants import CHECKPOINT_PATH, LAST_POSITIONS, WEB_MCTS_SIMULATIONS
-from env import board_to_planes
+from constants import (
+    CHECKPOINT_PATH,
+    LAST_POSITIONS,
+    WEB_MCTS_SIMULATIONS,
+    CONTEMPT_DRAW,
+    USE_FP16_INFERENCE,
+    USE_CHANNELS_LAST,
+)
 from nw import AlphaZeroNet as CNNActorCritic
 from agent import MCTS
 
@@ -24,7 +32,12 @@ app = FastAPI(
     title="Chess Agent Web API",
     description="Игра в шахматы против агента. Есть web UI и API.",
 )
-app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Optional: don't crash if static assets aren't present (API-only mode).
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+else:
+    print("[WARN] 'static/' directory not found; Web UI assets will not be served.")
 
 
 @dataclass
@@ -32,7 +45,8 @@ class GameState:
     id: str
     human_color: str
     board: chess.Board
-    history: deque
+    history: deque[chess.Board]
+    mcts: MCTS = field(repr=False, compare=False)
     moves_san: list[str] = field(default_factory=list)
     moves_uci: list[str] = field(default_factory=list)
     status: str = "ongoing"
@@ -52,8 +66,8 @@ def _pick_device() -> str:
     return dev
 
 
-device = _pick_device()
-model = CNNActorCritic().to(device)
+device = torch.device(_pick_device())
+model = CNNActorCritic().to(device).eval()
 
 if os.path.exists(CHECKPOINT_PATH):
     state_dict = torch.load(CHECKPOINT_PATH, map_location=device)
@@ -65,43 +79,81 @@ else:
     model.eval()
 
 
-mcts = MCTS(model=model, device=device)
+class LocalInferenceClient:
+    """Local (in-process) inference client that mimics the central inference server.
 
+    Why it exists:
+      - agent.MCTS expects `position_deque` to contain chess.Board objects.
+      - agent.MCTS supports sparse logits for legal moves only *only* via infer_client.
+      - agent.MCTS local (infer_client=None) path does not handle idxs slicing.
 
-
-def _mcts_run(board: chess.Board, history):
-    """Compatibility wrapper for MCTS.run() used by the web UI.
-
-    Your project has had multiple MCTS.run() signatures across versions.
-    The web API shouldn't care about the exact keyword names.
-
-    Strategy:
-    - Pass `history` as the *second positional* argument to avoid mismatch between
-      `position_history` and `position_deque`.
-    - Pass only kwargs that exist in the current signature (inspect.signature).
+    So the web API uses this client to keep compatibility and to work on CPU/GPU.
     """
-    sig = inspect.signature(mcts.run)
-    params = sig.parameters
 
-    kwargs = {}
+    def __init__(self, model_: CNNActorCritic, device_: torch.device):
+        self.model = model_
+        self.device = device_
+        self._lock = threading.Lock()
 
-    if "add_dirichlet_noise" in params:
-        kwargs["add_dirichlet_noise"] = False
+    def infer(self, obs_u8: np.ndarray, idxs_u16: np.ndarray | None = None):
+        # obs_u8 is (C,8,8) uint8 planes in {0,1}
+        obs_f = obs_u8.astype(np.float32, copy=False)
+        x = torch.from_numpy(obs_f).unsqueeze(0).to(self.device, dtype=torch.float32)
+        if self.device.type == "cuda" and USE_CHANNELS_LAST:
+            x = x.contiguous(memory_format=torch.channels_last)
 
-    # Reuse tree between subsequent UI calls, if supported.
-    if "reuse_tree" in params:
-        kwargs["reuse_tree"] = True
+        with self._lock, torch.no_grad():
+            if self.device.type == "cuda" and USE_FP16_INFERENCE:
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    pol_logits, _v_unused, wdl_logits = self.model(x)
+            else:
+                pol_logits, _v_unused, wdl_logits = self.model(x)
 
-    # Simulation count parameter names vary across versions.
-    if "number_of_simulations" in params:
-        kwargs["number_of_simulations"] = WEB_MCTS_SIMULATIONS
-    elif "mcts_sims" in params:
-        kwargs["mcts_sims"] = WEB_MCTS_SIMULATIONS
-    elif "num_simulations" in params:
-        kwargs["num_simulations"] = WEB_MCTS_SIMULATIONS
+            # Contempt-aware scalar value (matches main.py server mapping)
+            probs = torch.softmax(wdl_logits.float(), dim=1)  # (1,3)
+            value_t = (probs[:, 0] - probs[:, 2] + (CONTEMPT_DRAW * probs[:, 1]))
+            value = float(value_t.squeeze(0).item())
 
-    # NOTE: keep calling the underlying method here, not the wrapper.
-    return mcts.run(board, history, **kwargs)
+            pol_row = pol_logits.squeeze(0)
+            if idxs_u16 is None:
+                logits_t = pol_row
+            else:
+                idxs_t = torch.as_tensor(idxs_u16.astype(np.int64, copy=False), device=pol_row.device)
+                logits_t = pol_row.index_select(0, idxs_t)
+
+            logits = logits_t.detach().cpu().numpy()
+
+        return logits, value
+
+
+infer_client = LocalInferenceClient(model, device)
+
+
+def _engine_pick_move(game: GameState) -> tuple[chess.Move | None, dict[chess.Move, float]]:
+    """Run MCTS and pick a deterministic best move for the engine."""
+    board = game.board
+    if board.is_game_over(claim_draw=True):
+        return None, {}
+
+    # Ensure history includes the current position.
+    if not game.history or game.history[-1].fen() != board.fen():
+        game.history.append(board.copy(stack=False))
+
+    policy, _visit_counts = game.mcts.run(
+        board,
+        game.history,
+        add_dirichlet_noise=False,
+        reuse_tree=True,
+    )
+
+    if policy:
+        mv = max(policy.items(), key=lambda kv: kv[1])[0]
+    else:
+        # Fallback: random legal move.
+        legal = list(board.legal_moves)
+        mv = random.choice(legal) if legal else None
+
+    return mv, policy
 
 # -------- schemas --------
 class NewGameRequest(BaseModel):
@@ -158,16 +210,30 @@ def _human_color_bool(human_color: str) -> bool:
 def _new_game_state(human_color: str) -> GameState:
     board = chess.Board()
     hist = deque(maxlen=LAST_POSITIONS)
-    hist.append(board_to_planes(board))
-    return GameState(id=uuid4().hex, human_color=human_color, board=board, history=hist)
+    hist.append(board.copy(stack=False))
+
+    # Each game gets its own MCTS instance so tree reuse doesn't leak between games.
+    mcts_inst = MCTS(model=model, infer_client=infer_client, simulations=WEB_MCTS_SIMULATIONS)
+    return GameState(id=uuid4().hex, human_color=human_color, board=board, history=hist, mcts=mcts_inst)
 
 
 def _save_move(game: GameState, board: chess.Board, mv: chess.Move):
     san = board.san(mv)
+    board_before = board.copy(stack=False)
     board.push(mv)
+
+    # Keep MCTS root in sync for fast reuse.
+    if hasattr(game.mcts, "advance_root"):
+        try:
+            game.mcts.advance_root(board_before, mv)
+        except Exception:
+            # If tree reuse fails for any reason, just reset.
+            if hasattr(game.mcts, "reset"):
+                game.mcts.reset()
+
     game.moves_san.append(san)
     game.moves_uci.append(mv.uci())
-    game.history.append(board_to_planes(board))
+    game.history.append(board.copy(stack=False))
 
 
 def _update_game_status(game: GameState, board: chess.Board):
@@ -208,7 +274,7 @@ def new_game(req: NewGameRequest):
 
     # Если человек играет чёрными — движок делает первый ход сразу
     if human_bool == chess.BLACK:
-        mv, _policy = _mcts_run(board, game.history)
+        mv, _policy = _engine_pick_move(game)
         if mv is None:
             raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
         _save_move(game, board, mv)
@@ -285,7 +351,7 @@ def make_move(req: MoveRequest):
         )
 
     # ход движка
-    engine_move, _policy = _mcts_run(board, game.history)
+    engine_move, _policy = _engine_pick_move(game)
     if engine_move is None:
         raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
 
@@ -325,7 +391,7 @@ def engine_move(req: EngineMoveRequest):
     if board.turn == human_bool:
         raise HTTPException(status_code=400, detail="Сейчас ход человека, движок ходить не должен")
 
-    mv, _policy = _mcts_run(board, game.history)
+    mv, _policy = _engine_pick_move(game)
     if mv is None:
         raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
 
