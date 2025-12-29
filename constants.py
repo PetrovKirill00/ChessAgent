@@ -80,16 +80,6 @@ TEMPERATURE_MOVES = 30
 TEMPERATURE_TAU_START = 1.25
 TEMPERATURE_TAU_END = 0.25
 
-# -----------------------------
-# Draw shaping (training targets only)
-# -----------------------------
-# Eval/gating uses chess score: win=1, draw=0.5, loss=0.
-# Training can still discourage draws via a small negative value.
-CONTEMPT_AGAINST_DRAW = 0.0  # deprecated: draws are trained as honest draws
-
-# Stronger penalty specifically for threefold repetition (optional).
-REPETITION_PENALTY = 0.0  # deprecated: draws are trained as honest draws
-
 # If True: claim draw by threefold repetition when checking termination.
 # If False: repetitions won't immediately terminate; games rely on MAX_GAME_LENGTH.
 THREEFOLD = True
@@ -120,7 +110,7 @@ P_MATE_IN_BATCH = 0.5
 # -----------------------------
 # Multi-process self-play
 # -----------------------------
-NUM_SELFPLAY_WORKERS = 12
+NUM_SELFPLAY_WORKERS = 16
 
 # -----------------------------
 # Central inference server (main process)
@@ -140,7 +130,7 @@ SAVE_BUFFER_PER_GAMES = 500
 # -----------------------------
 # Evaluation (arena + gating)
 # -----------------------------
-EVAL_EVERY_GAMES = 25
+EVAL_EVERY_GAMES = 500
 EVAL_NUM_GAMES = 50
 
 # A secondary, human-readable metric.
