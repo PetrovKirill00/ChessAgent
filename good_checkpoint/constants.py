@@ -83,9 +83,9 @@ P_MATE_IN_BATCH = 0.5
 # -----------------------------
 # Training
 # -----------------------------
-BATCH_SIZE = 1024
+BATCH_SIZE = 256
 TRAIN_STEPS_PER_GAME = 4
-LEARNING_RATE = 2e-4
+LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 
 # -----------------------------
@@ -125,7 +125,7 @@ TRAIN_TIME_BUDGET_S = 0.25  # 0.0 to disable time budget
 # -----------------------------
 # Evaluation + gating
 # -----------------------------
-EVAL_EVERY_GAMES = 3001
+EVAL_EVERY_GAMES = 1000
 EVAL_NUM_GAMES = 50
 EVAL_MAX_GAME_LENGTH = 768
 
@@ -151,12 +151,12 @@ EVAL_PROMOTE_SCORE = 0.55
 EVAL_SCORE_Z = 1.96
 
 # MCTS for eval (keep smaller than self-play by default)
-EVAL_MCTS_SIMULATIONS = 128
+EVAL_MCTS_SIMULATIONS = 512
 
 # -----------------------------
 # Web UI / API (web_api.py)
 # -----------------------------
-WEB_MCTS_SIMULATIONS = 1024
+WEB_MCTS_SIMULATIONS = 2048
 
 # Mixed precision for inference (only affects forward pass under CUDA).
 USE_FP16_INFERENCE = True
