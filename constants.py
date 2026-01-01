@@ -103,7 +103,7 @@ IPC_SEND_ONLY_LEGAL = True          # send only logits for legal moves (requires
 # -----------------------------
 # Central inference server (main process)
 # -----------------------------
-NUM_SELFPLAY_WORKERS = 12
+NUM_SELFPLAY_WORKERS = 16
 SERVER_MAX_INFERENCE_POSITIONS = 1024      # max batch size
 SERVER_BATCH_TIMEOUT_S = 0.002             # batching latency
 SERVER_TICK_EVERY_S = 5.0                  # console tick
@@ -114,7 +114,7 @@ SERVER_RESPONSE_PUT_TIMEOUT_S = 0.5        # timeout for putting responses to wo
 # -----------------------------
 # Saving
 # -----------------------------
-SAVE_MODEL_PER_GAMES = 50
+SAVE_MODEL_PER_GAMES = 100
 SAVE_BUFFER_PER_GAMES = 1000
 
 ASYNC_REPLAY_SAVE = True  # save replay buffer in background thread
