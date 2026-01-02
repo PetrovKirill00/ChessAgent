@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 import random
 import threading
 import time
@@ -34,6 +35,15 @@ app = FastAPI(
     description="Игра в шахматы против агента. Есть web UI и API.",
 )
 
+
+@app.on_event("shutdown")
+def _on_shutdown():
+    # Stop pondering threads (important for uvicorn --reload and restarts).
+    with games_lock:
+        for _gid, _g in list(games.items()):
+            _stop_pondering(_g, join_timeout_s=0.1)
+        games.clear()
+
 # Optional: don't crash if static assets aren't present (API-only mode).
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -55,8 +65,117 @@ class GameState:
     termination: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
+    # --- concurrency / pondering ---
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
+    stop_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
+    ponder_thread: threading.Thread | None = field(default=None, repr=False, compare=False)
+
+    # --- per-engine-move simulation budget (minimum) ---
+    engine_target_fen: str | None = None
+    engine_target_sims: int | None = None
+
 
 games: dict[str, GameState] = {}
+games_lock = threading.RLock()
+
+
+# -------- pondering helpers (web) --------
+# We "ponder" (run MCTS continuously) even when it's not the engine's turn.
+# For each engine move we sample a *minimum* simulation budget:
+#   sims ~ Normal(mu=WEB_MCTS_SIMULATIONS, sigma=WEB_MCTS_SIMULATIONS/10)
+# The engine may exceed this minimum if the opponent takes long (pondering accumulates extra sims).
+_WEB_MCTS_SIGMA = float(WEB_MCTS_SIMULATIONS) / 10.0
+
+# Small chunks keep the lock hold time short so UI requests stay responsive.
+_PONDER_CHUNK_SIMS = 16
+_PICK_CHUNK_SIMS = 64
+
+# Yield after each ponder chunk to avoid starving other threads.
+_PONDER_YIELD_S = 0.0
+
+
+def _engine_color_bool(game: GameState) -> bool:
+    return (not _human_color_bool(game.human_color))
+
+
+def _sample_engine_budget_sims() -> int:
+    # Truncated normal at >= 1. (Negative values are astronomically unlikely but still possible.)
+    x = float(np.random.normal(loc=float(WEB_MCTS_SIMULATIONS), scale=_WEB_MCTS_SIGMA))
+    n = int(round(x))
+    return max(1, n)
+
+
+def _ensure_history_current(game: GameState) -> None:
+    b = game.board
+    if not game.history or game.history[-1].fen() != b.fen():
+        game.history.append(b.copy(stack=False))
+
+
+def _ensure_engine_target(game: GameState) -> int:
+    # Must be called under game.lock.
+    if game.board.turn != _engine_color_bool(game):
+        # Not engine to move -> target is irrelevant right now.
+        return 0
+    fen = game.board.fen()
+    if game.engine_target_fen != fen or game.engine_target_sims is None:
+        game.engine_target_fen = fen
+        game.engine_target_sims = _sample_engine_budget_sims()
+    return int(game.engine_target_sims)
+
+
+def _mcts_run(game: GameState, sims: int) -> tuple[dict[chess.Move, float], dict[chess.Move, int]]:
+    # Must be called under game.lock.
+    _ensure_history_current(game)
+    game.mcts.simulations = int(sims)
+    return game.mcts.run(game.board, game.history, add_dirichlet_noise=False, reuse_tree=True)
+
+
+def _ponder_loop(game: GameState) -> None:
+    # Daemon thread: runs until stop_event or game finishes.
+    while not game.stop_event.is_set():
+        with game.lock:
+            if game.status != "ongoing":
+                break
+            if game.board.is_game_over(claim_draw=True):
+                break
+
+            # Keep target synced for the current engine-to-move position (if applicable).
+            _ = _ensure_engine_target(game)
+
+            # One small chunk of search.
+            _mcts_run(game, _PONDER_CHUNK_SIMS)
+
+        # Yield so request handlers can grab the lock quickly.
+        time.sleep(_PONDER_YIELD_S)
+
+
+def _start_pondering(game: GameState) -> None:
+    # Must be called once right after game creation.
+    with game.lock:
+        if game.ponder_thread is not None and game.ponder_thread.is_alive():
+            return
+        game.stop_event.clear()
+        t = threading.Thread(target=_ponder_loop, args=(game,), daemon=True, name=f"ponder-{game.id[:8]}")
+        game.ponder_thread = t
+        t.start()
+
+
+def _stop_pondering(game: GameState, *, join_timeout_s: float = 0.2):
+    """Signal the pondering thread to stop and optionally join briefly.
+
+    We keep this lightweight so request handlers won't block for long.
+    """
+    try:
+        game.stop_event.set()
+    except Exception:
+        pass
+    t = getattr(game, "ponder_thread", None)
+    if t is not None and t.is_alive():
+        try:
+            t.join(timeout=join_timeout_s)
+        except Exception:
+            pass
+
 
 
 # -------- model / mcts --------
@@ -169,30 +288,52 @@ infer_client = LocalInferenceClient(model, device)
 
 
 def _engine_pick_move(game: GameState) -> tuple[chess.Move | None, dict[chess.Move, float]]:
-    """Run MCTS and pick a deterministic best move for the engine."""
-    board = game.board
-    if board.is_game_over(claim_draw=True):
-        return None, {}
+    """Pick best move for the engine.
 
-    # Ensure history includes the current position.
-    if not game.history or game.history[-1].fen() != board.fen():
-        game.history.append(board.copy(stack=False))
+    Guarantees a per-move *minimum* MCTS budget sampled from Normal(WEB_MCTS_SIMULATIONS, WEB_MCTS_SIMULATIONS/10),
+    but the actual number of simulations may be higher if pondering accumulated extra search.
+    """
+    with game.lock:
+        board = game.board
+        if board.is_game_over(claim_draw=True):
+            return None, {}
 
-    policy, _visit_counts = game.mcts.run(
-        board,
-        game.history,
-        add_dirichlet_noise=False,
-        reuse_tree=True,
-    )
+        engine_bool = _engine_color_bool(game)
+        if board.turn != engine_bool:
+            # Not engine's turn (caller error).
+            return None, {}
 
+        # Ensure target for this exact position.
+        target = _ensure_engine_target(game)
+
+        # Query current search stats WITHOUT adding simulations.
+        policy, visit_counts = _mcts_run(game, sims=0)
+        sims_done = int(sum(visit_counts.values()))
+
+    # Add more simulations until we reach the sampled minimum.
+    while sims_done < target:
+        with game.lock:
+            if game.board.is_game_over(claim_draw=True):
+                return None, {}
+            if game.board.turn != _engine_color_bool(game):
+                return None, {}
+
+            remain = int(target - sims_done)
+            chunk = int(min(_PICK_CHUNK_SIMS, remain))
+            policy, visit_counts = _mcts_run(game, sims=chunk)
+            sims_done = int(sum(visit_counts.values()))
+
+    # Deterministic best move from final policy.
     if policy:
         mv = max(policy.items(), key=lambda kv: kv[1])[0]
     else:
         # Fallback: random legal move.
-        legal = list(board.legal_moves)
+        with game.lock:
+            legal = list(game.board.legal_moves)
         mv = random.choice(legal) if legal else None
 
     return mv, policy
+
 
 # -------- schemas --------
 class NewGameRequest(BaseModel):
@@ -220,7 +361,7 @@ class MoveResponse(BaseModel):
     termination: str | None
 
 
-# -------- helpers --------
+
 def _promotion_piece(p: str | None):
     if not p:
         return None
@@ -229,6 +370,7 @@ def _promotion_piece(p: str | None):
     if out is None:
         raise HTTPException(status_code=400, detail="Некорректная фигура для превращения (q/r/b/n)")
     return out
+
 
 
 def _outcome_info(board: chess.Board):
@@ -253,43 +395,59 @@ def _new_game_state(human_color: str) -> GameState:
 
     # Each game gets its own MCTS instance so tree reuse doesn't leak between games.
     mcts_inst = MCTS(model=model, infer_client=infer_client, simulations=WEB_MCTS_SIMULATIONS)
-    return GameState(id=uuid4().hex, human_color=human_color, board=board, history=hist, mcts=mcts_inst)
+    game = GameState(id=uuid4().hex, human_color=human_color, board=board, history=hist, mcts=mcts_inst)
+
+    # Start continuous pondering immediately.
+    _start_pondering(game)
+    return game
 
 
 def _save_move(game: GameState, board: chess.Board, mv: chess.Move):
-    san = board.san(mv)
-    board_before = board.copy(stack=False)
-    board.push(mv)
+    # Note: game.lock is an RLock; it's OK if caller already holds it.
+    with game.lock:
+        san = board.san(mv)
+        board_before = board.copy(stack=False)
+        board.push(mv)
 
-    # Keep MCTS root in sync for fast reuse.
-    if hasattr(game.mcts, "advance_root"):
-        try:
-            game.mcts.advance_root(board_before, mv)
-        except Exception:
-            # If tree reuse fails for any reason, just reset.
-            if hasattr(game.mcts, "reset"):
-                game.mcts.reset()
+        # Keep MCTS root in sync for fast reuse.
+        if hasattr(game.mcts, "advance_root"):
+            try:
+                game.mcts.advance_root(board_before, mv)
+            except Exception:
+                # If tree reuse fails for any reason, just reset.
+                if hasattr(game.mcts, "reset"):
+                    game.mcts.reset()
 
-    game.moves_san.append(san)
-    game.moves_uci.append(mv.uci())
-    game.history.append(board.copy(stack=False))
+        # New position => new target (will be sampled when engine is to move).
+        game.engine_target_fen = None
+        game.engine_target_sims = None
+
+        game.moves_san.append(san)
+        game.moves_uci.append(mv.uci())
+        game.history.append(board.copy(stack=False))
 
 
 def _update_game_status(game: GameState, board: chess.Board):
-    game_over, result, termination = _outcome_info(board)
-    if game_over:
-        game.status = "finished"
-        game.result = result
-        game.termination = termination
-    else:
-        game.status = "ongoing"
-        game.result = None
-        game.termination = None
-    return game_over, result, termination
+    with game.lock:
+        game_over, result, termination = _outcome_info(board)
+        if game_over:
+            game.status = "finished"
+            game.result = result
+            game.termination = termination
+            try:
+                game.stop_event.set()
+            except Exception:
+                pass
+        else:
+            game.status = "ongoing"
+            game.result = None
+            game.termination = None
+        return game_over, result, termination
 
 
 def _get_game(game_id: str) -> GameState:
-    game = games.get(game_id)
+    with games_lock:
+        game = games.get(game_id)
     if game is None:
         raise HTTPException(status_code=404, detail="Game not found")
     return game
@@ -306,7 +464,14 @@ def new_game(req: NewGameRequest):
     human_color = req.human_color if req.human_color in ("w", "b") else "w"
     human_bool = _human_color_bool(human_color)
 
-    game = _new_game_state(human_color)
+    # This web UI expects a single active game. Stop old pondering threads so they
+    # don't keep consuming inference/GPU and slowing down the new game.
+    with games_lock:
+        for _gid, _g in list(games.items()):
+            _stop_pondering(_g)
+        games.clear()
+
+    game = _new_game_state(human_color)(human_color)
     board = game.board
 
     engine_move_uci = None
@@ -320,13 +485,18 @@ def new_game(req: NewGameRequest):
         engine_move_uci = mv.uci()
 
     game_over, result, termination = _update_game_status(game, board)
-    games[game.id] = game
+    with games_lock:
+        games[game.id] = game
+
+    with game.lock:
+        fen = board.fen()
+        moves_san = list(game.moves_san)
 
     return MoveResponse(
         game_id=game.id,
-        board_fen=board.fen(),
+        board_fen=fen,
         engine_move=engine_move_uci,
-        moves_san=game.moves_san,
+        moves_san=moves_san,
         game_over=game_over,
         result=result,
         termination=termination,
@@ -338,58 +508,56 @@ def make_move(req: MoveRequest):
     game = _get_game(req.game_id)
     board = game.board
 
-    if board.is_game_over(claim_draw=True):
-        game_over, result, termination = _update_game_status(game, board)
-        return MoveResponse(
-            game_id=game.id,
-            board_fen=board.fen(),
-            engine_move=None,
-            moves_san=game.moves_san,
-            game_over=game_over,
-            result=result,
-            termination=termination,
-        )
+    with game.lock:
+        if board.is_game_over(claim_draw=True):
+            game_over, result, termination = _update_game_status(game, board)
+            return MoveResponse(
+                game_id=game.id,
+                board_fen=board.fen(),
+                engine_move=None,
+                moves_san=list(game.moves_san),
+                game_over=game_over,
+                result=result,
+                termination=termination,
+            )
 
-    human_bool = _human_color_bool(game.human_color)
-    if board.turn != human_bool:
-        raise HTTPException(status_code=400, detail="Сейчас не ход человека")
+        human_bool = _human_color_bool(game.human_color)
+        if board.turn != human_bool:
+            raise HTTPException(status_code=400, detail="Сейчас не ход человека")
 
-    # parse move
-    try:
-        from_sq = chess.parse_square(req.from_square)
-        to_sq = chess.parse_square(req.to_square)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Некорректный формат клетки")
+        try:
+            from_sq = chess.parse_square(req.from_square)
+            to_sq = chess.parse_square(req.to_square)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Некорректный формат клетки")
 
-    promo = _promotion_piece(req.promotion)
+        promo = _promotion_piece(req.promotion)
 
-    move_plain = chess.Move(from_sq, to_sq)
-    move_promo = chess.Move(from_sq, to_sq, promotion=promo) if promo is not None else None
+        move_plain = chess.Move(from_sq, to_sq)
+        move_promo = chess.Move(from_sq, to_sq, promotion=promo) if promo is not None else None
 
-    if move_plain in board.legal_moves:
-        user_move = move_plain
-    elif move_promo is not None and move_promo in board.legal_moves:
-        user_move = move_promo
-    else:
-        raise HTTPException(status_code=400, detail="Невозможный ход")
+        if move_plain in board.legal_moves:
+            user_move = move_plain
+        elif move_promo is not None and move_promo in board.legal_moves:
+            user_move = move_promo
+        else:
+            raise HTTPException(status_code=400, detail="Невозможный ход")
 
-    # save user move
     _save_move(game, board, user_move)
 
-    # если после хода человека игра закончилась
-    if board.is_game_over(claim_draw=True):
-        game_over, result, termination = _update_game_status(game, board)
-        return MoveResponse(
-            game_id=game.id,
-            board_fen=board.fen(),
-            engine_move=None,
-            moves_san=game.moves_san,
-            game_over=game_over,
-            result=result,
-            termination=termination,
-        )
+    with game.lock:
+        if board.is_game_over(claim_draw=True):
+            game_over, result, termination = _update_game_status(game, board)
+            return MoveResponse(
+                game_id=game.id,
+                board_fen=board.fen(),
+                engine_move=None,
+                moves_san=list(game.moves_san),
+                game_over=game_over,
+                result=result,
+                termination=termination,
+            )
 
-    # ход движка
     engine_move, _policy = _engine_pick_move(game)
     if engine_move is None:
         raise HTTPException(status_code=500, detail="Движок не смог выбрать ход (MCTS вернул None)")
@@ -398,11 +566,15 @@ def make_move(req: MoveRequest):
 
     game_over, result, termination = _update_game_status(game, board)
 
+    with game.lock:
+        fen = board.fen()
+        moves_san = list(game.moves_san)
+
     return MoveResponse(
         game_id=game.id,
-        board_fen=board.fen(),
+        board_fen=fen,
         engine_move=engine_move.uci(),
-        moves_san=game.moves_san,
+        moves_san=moves_san,
         game_over=game_over,
         result=result,
         termination=termination,
@@ -414,21 +586,22 @@ def engine_move(req: EngineMoveRequest):
     game = _get_game(req.game_id)
     board = game.board
 
-    if board.is_game_over(claim_draw=True):
-        game_over, result, termination = _update_game_status(game, board)
-        return MoveResponse(
-            game_id=game.id,
-            board_fen=board.fen(),
-            engine_move=None,
-            moves_san=game.moves_san,
-            game_over=game_over,
-            result=result,
-            termination=termination,
-        )
+    with game.lock:
+        if board.is_game_over(claim_draw=True):
+            game_over, result, termination = _update_game_status(game, board)
+            return MoveResponse(
+                game_id=game.id,
+                board_fen=board.fen(),
+                engine_move=None,
+                moves_san=list(game.moves_san),
+                game_over=game_over,
+                result=result,
+                termination=termination,
+            )
 
-    human_bool = _human_color_bool(game.human_color)
-    if board.turn == human_bool:
-        raise HTTPException(status_code=400, detail="Сейчас ход человека, движок ходить не должен")
+        human_bool = _human_color_bool(game.human_color)
+        if board.turn == human_bool:
+            raise HTTPException(status_code=400, detail="Сейчас ход человека, движок ходить не должен")
 
     mv, _policy = _engine_pick_move(game)
     if mv is None:
@@ -438,11 +611,15 @@ def engine_move(req: EngineMoveRequest):
 
     game_over, result, termination = _update_game_status(game, board)
 
+    with game.lock:
+        fen = board.fen()
+        moves_san = list(game.moves_san)
+
     return MoveResponse(
         game_id=game.id,
-        board_fen=board.fen(),
+        board_fen=fen,
         engine_move=mv.uci(),
-        moves_san=game.moves_san,
+        moves_san=moves_san,
         game_over=game_over,
         result=result,
         termination=termination,
@@ -452,24 +629,26 @@ def engine_move(req: EngineMoveRequest):
 @app.get("/games/{game_id}")
 def get_game(game_id: str):
     game = _get_game(game_id)
-    return {
-        "game_id": game.id,
-        "status": game.status,
-        "human_color": game.human_color,
-        "result": game.result,
-        "termination": game.termination,
-        "fen": game.board.fen(),
-        "created_at": game.created_at.isoformat(),
-    }
+    with game.lock:
+        return {
+            "game_id": game.id,
+            "status": game.status,
+            "human_color": game.human_color,
+            "result": game.result,
+            "termination": game.termination,
+            "fen": game.board.fen(),
+            "created_at": game.created_at.isoformat(),
+        }
 
 
 @app.get("/games/{game_id}/moves")
 def get_moves(game_id: str):
     game = _get_game(game_id)
-    out = []
-    for idx, (uci, san) in enumerate(zip(game.moves_uci, game.moves_san), start=1):
-        out.append({"ply": idx, "uci": uci, "san": san})
-    return out
+    with game.lock:
+        out = []
+        for idx, (uci, san) in enumerate(zip(game.moves_uci, game.moves_san), start=1):
+            out.append({"ply": idx, "uci": uci, "san": san})
+        return out
 
 
 # -------- Web UI --------
