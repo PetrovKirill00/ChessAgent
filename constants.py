@@ -104,7 +104,7 @@ IPC_SEND_ONLY_LEGAL = True          # send only logits for legal moves (requires
 # -----------------------------
 # Central inference server (main process)
 # -----------------------------
-NUM_SELFPLAY_WORKERS = 16
+NUM_SELFPLAY_WORKERS = 24
 SERVER_MAX_INFERENCE_POSITIONS = 1024      # max batch size
 SERVER_BATCH_TIMEOUT_S = 0.002             # batching latency
 SERVER_TICK_EVERY_S = 5.0                  # console tick
