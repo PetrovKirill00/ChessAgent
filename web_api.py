@@ -471,7 +471,7 @@ def new_game(req: NewGameRequest):
             _stop_pondering(_g)
         games.clear()
 
-    game = _new_game_state(human_color)(human_color)
+    game = _new_game_state(human_color)
     board = game.board
 
     engine_move_uci = None
