@@ -77,8 +77,8 @@ CONTEMPT_DRAW = -0.05
 # Replay buffer
 # -----------------------------
 REPLAY_CAPACITY = 700_000
-REPLAY_TARGET_MATE_FRACTION = 0.5  # target fraction of mate samples stored (rest are draws)
-P_MATE_IN_BATCH = 0.5
+REPLAY_TARGET_MATE_FRACTION = 0.7  # target fraction of mate samples stored (rest are draws)
+P_MATE_IN_BATCH = 0.7
 
 # -----------------------------
 # Training
